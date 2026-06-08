@@ -853,7 +853,7 @@ async def telegram_webhook(request: Request):
                     "/help — Show this message"
                 )
                 if is_owner(user_id):
-                    cmd += "\n\n👑 <b>Owner Commands</b>\n/addadmin [chat_id]\n/removeadmin [chat_id]\n/listadmins"
+                    cmd += "\n\n👑 <b>Owner Commands</b>\n/addadmin [chat_id]\n/removeadmin [chat_id]\n/listadmins\n/reset — Clear used topics & start fresh"
                 await send_telegram(chat_id, cmd)
 
             elif text == "/trends":
@@ -968,6 +968,27 @@ async def telegram_webhook(request: Request):
                 conn.close()
                 lines = "\n".join([f"• {r['chat_id']} (@{r['username'] or 'unknown'}) — {str(r['added_at'])[:10]}" for r in rows])
                 await send_telegram(chat_id, f"👥 <b>Admins ({len(rows)})</b>\n\n{lines}")
+
+            elif text == "/reset":
+                if not is_owner(user_id):
+                    await send_telegram(chat_id, "⛔ Owner only.")
+                    return {"ok": True}
+                try:
+                    conn = get_db()
+                    cur = conn.cursor()
+                    cur.execute("SELECT COUNT(*) as c FROM used_topics")
+                    count = cur.fetchone()["c"]
+                    cur.execute("DELETE FROM used_topics")
+                    conn.commit()
+                    cur.close()
+                    conn.close()
+                    await send_telegram(chat_id,
+                        f"♻️ <b>Reset complete.</b>\n\n"
+                        f"Cleared {count} used topics.\n"
+                        f"All trends are now fresh — send /generate to start."
+                    )
+                except Exception as e:
+                    await send_telegram(chat_id, f"❌ Reset error: {e}")
 
     except Exception as e:
         logger.error(f"Webhook error: {e}")
