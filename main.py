@@ -5,7 +5,8 @@ import asyncio
 import logging
 import re
 import xml.etree.ElementTree as ET
-from datetime import datetime
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 from typing import Optional, List
 
 import httpx
@@ -18,10 +19,9 @@ import groq
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="NaijaFlash API", version="3.0.0")
+app = FastAPI(title="NaijaFlash API", version="4.0.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
-# ── ENV ──
 DATABASE_URL = os.getenv("DATABASE_URL")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
@@ -31,28 +31,83 @@ UNSPLASH_ACCESS_KEY = os.getenv("UNSPLASH_ACCESS_KEY")
 PEXELS_API_KEY = os.getenv("PEXELS_API_KEY")
 NEWS_API_KEY = os.getenv("NEWS_API_KEY")
 API_FOOTBALL_KEY = os.getenv("API_FOOTBALL_KEY")
+GNEWS_API_KEY = os.getenv("GNEWS_API_KEY")
 
 CATEGORIES = ["entertainment", "finance", "tech", "health", "education", "news", "football"]
 
-CAT_KEYWORDS = {
-    "football": ["football","soccer","epl","ucl","champions league","la liga","serie a","bundesliga",
-                 "premier league","afcon","super eagles","fifa","goal","match","score","vs","fc ",
-                 "united","city","arsenal","chelsea","liverpool","barcelona","madrid","osimhen",
-                 "lookman","saka","mbappe","haaland","yamal","ronaldo","messi","bundesliga"],
-    "finance": ["naira","dollar","bitcoin","crypto","cbn","bank","money","invest","usdt","eth","bnb",
-                "exchange rate","interest rate","inflation","stock","forex","binance","coinbase",
-                "paystack","flutterwave","gtbank","access bank","zenith","uba","stanbic"],
-    "entertainment": ["nollywood","davido","burna","wizkid","asake","olamide","tems","ckay","rema",
-                      "celebrity","movie","music","album","concert","grammy","award","netflix","amvca",
-                      "bbnaija","big brother","afrobeats","singer","actor","actress"],
-    "tech": ["phone","iphone","samsung","tecno","infinix","itel","xiaomi","app","startup","software",
-             "android","ios","laptop","computer","gadget","data","internet","5g","ai","artificial intelligence"],
-    "health": ["health","malaria","typhoid","hospital","drug","medication","symptom","diabetes","blood pressure",
-               "cancer","hiv","covid","vaccine","doctor","nurse","ministry of health","lassa","cholera"],
-    "education": ["jamb","waec","neco","school","university","polytechnic","scholarship","job","graduate",
-                  "nysc","admission","cut off","result","strike","asuu","education ministry"],
-    "news": ["tinubu","obi","atiku","governor","senate","house of rep","court","police","army","military",
-             "attack","protest","strike","government","minister","policy","law","election","vote"]
+# ── KEYWORD SETS ──
+# "vs" pattern handled separately — always football
+FOOTBALL_KEYWORDS = [
+    "football","soccer","epl","ucl","champions league","la liga","serie a","bundesliga",
+    "premier league","afcon","super eagles","fifa","goal","match","score","fixture",
+    "united","arsenal","chelsea","liverpool","barcelona","madrid","juventus","psg","milan",
+    "osimhen","lookman","saka","mbappe","mbappé","haaland","yamal","vinicius","bellingham",
+    "ronaldo","messi","neymar","salah","kane","transfer","signing","winger","striker",
+    "goalkeeper","defender","midfielder","manager","coach","league table","standings",
+    "hat trick","penalty","red card","yellow card","offside","var","half time","full time",
+    "iwobi","chukwueze","ndidi","aribo","troost-ekong","nkwocha","ighalo","enyimba",
+    "kano pillars","rangers fc nigeria","naija football"
+]
+
+FINANCE_KEYWORDS = [
+    "naira","dollar","pound","euro","exchange rate","cbn","central bank","inflation",
+    "bitcoin","btc","ethereum","eth","crypto","usdt","bnb","solana","binance","coinbase",
+    "invest","investment","stock","shares","nse","dangote","flutterwave","paystack",
+    "gtbank","access bank","zenith","uba","fidelity bank","interest rate","loan","mortgage",
+    "forex","money","fund","budget","economy","gdp","recession","salary","wage","tax",
+    "pension","saving","opay","palmpay","kuda","piggyvest","cowrywise"
+]
+
+ENTERTAINMENT_KEYWORDS = [
+    "nollywood","davido","burna boy","wizkid","asake","olamide","tems","ckay","rema",
+    "celebrity","movie","film","music","album","song","concert","grammy","award","amvca",
+    "bbnaija","big brother","afrobeats","singer","actor","actress","rapper","producer",
+    "tiwa savage","yemi alade","patoranking","fireboy","omah lay","kizz daniel",
+    "adekunle gold","simi","netflix","amazon prime","iroko tv","festival","tour",
+    "music video","collaboration","feature","remix","ep","playlist"
+]
+
+TECH_KEYWORDS = [
+    "iphone","samsung","tecno","infinix","itel","xiaomi","oppo","vivo","oneplus","realme",
+    "phone","smartphone","laptop","computer","tablet","gadget","app","software","android",
+    "ios","data plan","internet","5g","4g","wifi","broadband","mtn","airtel","glo","9mobile",
+    "startup","tech company","artificial intelligence","ai","chatgpt","robot","drone",
+    "electric car","ev","solar","renewable","cybersecurity","hack","data breach"
+]
+
+HEALTH_KEYWORDS = [
+    "health","malaria","typhoid","cholera","lassa fever","hiv","aids","covid","monkeypox",
+    "hospital","clinic","doctor","nurse","medication","drug","symptom","treatment","vaccine",
+    "diabetes","blood pressure","hypertension","cancer","stroke","heart attack","fever",
+    "headache","pregnancy","birth","infant","child health","ministry of health","who","nafdac",
+    "pharmacy","chemist","herbal","remedy","diet","nutrition","fitness","mental health"
+]
+
+EDUCATION_KEYWORDS = [
+    "jamb","waec","neco","nabteb","school","university","polytechnic","college","student",
+    "scholarship","bursary","grant","job","employment","graduate","nysc","admission",
+    "cut off mark","result","timetable","examination","exam","asuu","strike","lecturer",
+    "professor","vice chancellor","education ministry","subeb","ubec","post utme",
+    "direct entry","degree","hnd","ond","masters","phd","fellowship","internship"
+]
+
+NEWS_KEYWORDS = [
+    "tinubu","peter obi","atiku","el-rufai","wike","obi cubana","governor","senate",
+    "house of rep","court","supreme court","efcc","icpc","police","army","military",
+    "attack","bandits","boko haram","ipob","protest","strike","riot","government",
+    "minister","commissioner","policy","law","bill","election","vote","inec","tribunal",
+    "budget","subsidy","fuel","petrol","electricity","power","tariff","tax","customs",
+    "immigration","visa","passport","foreign affairs","united nations","african union"
+]
+
+CAT_KEYWORD_MAP = {
+    "football": FOOTBALL_KEYWORDS,
+    "finance": FINANCE_KEYWORDS,
+    "entertainment": ENTERTAINMENT_KEYWORDS,
+    "tech": TECH_KEYWORDS,
+    "health": HEALTH_KEYWORDS,
+    "education": EDUCATION_KEYWORDS,
+    "news": NEWS_KEYWORDS,
 }
 
 CAT_PROMPTS = {
@@ -64,6 +119,23 @@ CAT_PROMPTS = {
     "news": "Nigerian news, politics, government policy, social issues",
     "football": "Nigerian and international football, match reports, player stats, Super Eagles"
 }
+
+# Known footballer names and teams for classification boost
+KNOWN_FOOTBALLERS = [
+    "mbappe","mbappé","haaland","yamal","vinicius","bellingham","salah","kane",
+    "osimhen","lookman","saka","ronaldo","messi","neymar","rashford","de bruyne",
+    "rodri","pedri","gavi","lewandowski","benzema","modric","kroos","alisson",
+    "ederson","neuer","courtois","ter stegen","dembele","griezmann","kante",
+    "pogba","lukaku","sterling","mount","trent","robertson","van dijk"
+]
+
+KNOWN_TEAMS = [
+    "arsenal","chelsea","liverpool","manchester","city","united","tottenham","spurs",
+    "barcelona","madrid","juventus","milan","inter","napoli","roma","psg","dortmund",
+    "bayern","atletico","sevilla","valencia","villarreal","porto","benfica","ajax",
+    "rangers","celtic","feyenoord","club brugge","lazio","atalanta","leicester",
+    "everton","newcastle","aston villa","west ham","wolves","brighton","brentford"
+]
 
 # ── DB ──
 def get_db():
@@ -135,121 +207,175 @@ def is_owner(chat_id: int) -> bool:
 def is_admin(chat_id: int) -> bool:
     return chat_id in get_all_admins()
 
-# ── CLASSIFY TOPIC ──
+# ── SMART CLASSIFIER ──
 def classify_topic(topic: str) -> Optional[str]:
-    t = topic.lower()
-    scores = {cat: 0 for cat in CATEGORIES}
-    for cat, keywords in CAT_KEYWORDS.items():
+    """
+    Classify a trending topic into one of our 7 categories.
+    Returns None if not confident enough — topic will be skipped.
+    """
+    t = topic.lower().strip()
+
+    # Rule 1: "X vs Y" or "X v Y" pattern = always football
+    if re.search(r'\bvs?\b', t) or ' v ' in t:
+        return "football"
+
+    # Rule 2: Check for known footballer names
+    for name in KNOWN_FOOTBALLERS:
+        if name in t:
+            return "football"
+
+    # Rule 3: Check for known team names
+    for team in KNOWN_TEAMS:
+        if team in t:
+            return "football"
+
+    # Rule 4: Score each category by keyword matches
+    scores = {}
+    for cat, keywords in CAT_KEYWORD_MAP.items():
+        score = 0
         for kw in keywords:
             if kw in t:
-                scores[cat] += 1
-    best = max(scores, key=scores.get)
-    if scores[best] == 0:
-        return None  # Not relevant to any category
-    return best
+                # Longer keyword matches = more confident
+                score += len(kw.split())
+        if score > 0:
+            scores[cat] = score
+
+    if not scores:
+        return None  # Not confident — skip this topic
+
+    # Rule 5: Require minimum confidence score of 1
+    best_cat = max(scores, key=scores.get)
+    if scores[best_cat] < 1:
+        return None
+
+    # Rule 6: If two categories tie, prefer more specific one
+    sorted_scores = sorted(scores.items(), key=lambda x: x[1], reverse=True)
+    if len(sorted_scores) > 1 and sorted_scores[0][1] == sorted_scores[1][1]:
+        # Tie — pick whichever is not "news" (more specific)
+        for cat, score in sorted_scores:
+            if cat != "news":
+                return cat
+
+    return best_cat
 
 # ── GOOGLE TRENDS RSS ──
 async def fetch_nigeria_trends() -> List[dict]:
-    """Fetch real trending topics in Nigeria from Google Trends RSS."""
+    """
+    Fetch trending topics in Nigeria from Google Trends RSS.
+    Only returns topics from last 24 hours, correctly classified.
+    """
     trends = []
+    skipped = []
+
     try:
         async with httpx.AsyncClient(timeout=15) as client:
             r = await client.get(
                 "https://trends.google.com/trending/rss?geo=NG",
                 headers={"User-Agent": "Mozilla/5.0 (compatible; NaijaFlash/1.0)"}
             )
-            if r.status_code == 200:
-                root = ET.fromstring(r.text)
-                items = root.findall(".//item")
-                for item in items:
-                    title_el = item.find("title")
-                    if title_el is not None and title_el.text:
-                        topic = title_el.text.strip()
-                        cat = classify_topic(topic)
-                        if cat:  # Only include if it matches our categories
-                            trends.append({"topic": topic, "category": cat})
-                logger.info(f"Google Trends: found {len(trends)} relevant trends from Nigeria")
+            if r.status_code != 200:
+                logger.error(f"Google Trends returned {r.status_code}")
+                return []
+
+            root = ET.fromstring(r.text)
+            items = root.findall(".//item")
+            now = datetime.now(timezone.utc)
+
+            for item in items:
+                title_el = item.find("title")
+                pubdate_el = item.find("pubDate")
+
+                if title_el is None or not title_el.text:
+                    continue
+
+                topic = title_el.text.strip()
+
+                # Recency filter — skip if older than 24 hours
+                if pubdate_el is not None and pubdate_el.text:
+                    try:
+                        pub_dt = parsedate_to_datetime(pubdate_el.text)
+                        age_hours = (now - pub_dt).total_seconds() / 3600
+                        if age_hours > 24:
+                            skipped.append(f"OLD({age_hours:.0f}h): {topic}")
+                            continue
+                    except Exception:
+                        pass  # If we can't parse date, allow it through
+
+                # Category classification
+                cat = classify_topic(topic)
+                if cat is None:
+                    skipped.append(f"UNCLASSIFIED: {topic}")
+                    continue
+
+                trends.append({"topic": topic, "category": cat})
+
+            logger.info(f"Google Trends Nigeria: {len(trends)} valid, {len(skipped)} skipped")
+            if skipped:
+                logger.info(f"Skipped: {skipped[:10]}")
+
     except Exception as e:
         logger.error(f"Google Trends RSS error: {e}")
+
     return trends
 
-# ── FETCH REAL NEWS INFO ──
+# ── FETCH NEWS CONTEXT ──
 async def fetch_news_context(topic: str) -> str:
-    """Fetch real news/info about a topic to give AI real facts."""
-    context = ""
+    """Fetch real current news about a topic."""
 
-    # Try GNews API (free tier: 100 requests/day)
-    try:
-        async with httpx.AsyncClient(timeout=10) as client:
-            r = await client.get(
-                "https://gnews.io/api/v4/search",
-                params={
-                    "q": topic,
-                    "lang": "en",
-                    "country": "ng",
-                    "max": 5,
-                    "token": os.getenv("GNEWS_API_KEY", "")
-                }
-            )
-            if r.status_code == 200:
-                articles = r.json().get("articles", [])
-                if articles:
-                    summaries = []
-                    for a in articles[:4]:
-                        summaries.append(
-                            f"Headline: {a.get('title','')}\n"
-                            f"Source: {a.get('source',{}).get('name','')}\n"
-                            f"Summary: {a.get('description','')}"
-                        )
-                    context = "\n\n".join(summaries)
-                    logger.info(f"GNews: got {len(articles)} articles for '{topic}'")
-                    return context
-    except Exception as e:
-        logger.info(f"GNews failed: {e}")
+    # Try GNews first
+    if GNEWS_API_KEY:
+        try:
+            async with httpx.AsyncClient(timeout=10) as client:
+                r = await client.get(
+                    "https://gnews.io/api/v4/search",
+                    params={"q": topic, "lang": "en", "max": 5, "token": GNEWS_API_KEY}
+                )
+                if r.status_code == 200:
+                    articles = r.json().get("articles", [])
+                    if articles:
+                        summaries = [
+                            f"Headline: {a.get('title','')}\nSource: {a.get('source',{}).get('name','')}\nSummary: {a.get('description','')}"
+                            for a in articles[:4] if a.get('title')
+                        ]
+                        if summaries:
+                            logger.info(f"GNews: {len(summaries)} articles for '{topic}'")
+                            return "\n\n".join(summaries)
+        except Exception as e:
+            logger.info(f"GNews failed: {e}")
 
-    # Try NewsAPI as fallback
+    # NewsAPI fallback
     if NEWS_API_KEY:
         try:
             async with httpx.AsyncClient(timeout=10) as client:
                 r = await client.get(
                     "https://newsapi.org/v2/everything",
-                    params={
-                        "q": topic,
-                        "language": "en",
-                        "sortBy": "publishedAt",
-                        "pageSize": 5,
-                        "apiKey": NEWS_API_KEY
-                    }
+                    params={"q": topic, "language": "en", "sortBy": "publishedAt", "pageSize": 5, "apiKey": NEWS_API_KEY}
                 )
                 if r.status_code == 200:
                     articles = r.json().get("articles", [])
                     if articles:
-                        summaries = []
-                        for a in articles[:4]:
-                            summaries.append(
-                                f"Headline: {a.get('title','')}\n"
-                                f"Source: {a.get('source',{}).get('name','')}\n"
-                                f"Summary: {a.get('description','')}"
-                            )
-                        context = "\n\n".join(summaries)
-                        logger.info(f"NewsAPI: got {len(articles)} articles for '{topic}'")
-                        return context
+                        summaries = [
+                            f"Headline: {a.get('title','')}\nSource: {a.get('source',{}).get('name','')}\nSummary: {a.get('description','')}"
+                            for a in articles[:4] if a.get('title') and '[Removed]' not in a.get('title','')
+                        ]
+                        if summaries:
+                            logger.info(f"NewsAPI: {len(summaries)} articles for '{topic}'")
+                            return "\n\n".join(summaries)
         except Exception as e:
             logger.info(f"NewsAPI failed: {e}")
 
-    return context
+    return ""
 
-# ── FETCH FOOTBALL STATS ──
+# ── FETCH FOOTBALL DATA ──
 async def fetch_football_data(topic: str) -> str:
-    """Fetch real football match data when a football topic is trending."""
+    """Fetch real match stats from API-Football."""
     if not API_FOOTBALL_KEY:
         return ""
     try:
         async with httpx.AsyncClient(timeout=10) as client:
-            # Search for fixtures related to the topic
             r = await client.get(
                 "https://v3.football.api-sports.io/fixtures",
-                params={"last": 5, "timezone": "Africa/Lagos"},
+                params={"last": 10, "timezone": "Africa/Lagos"},
                 headers={"x-apisports-key": API_FOOTBALL_KEY}
             )
             if r.status_code == 200:
@@ -260,18 +386,19 @@ async def fetch_football_data(topic: str) -> str:
                     home = f["teams"]["home"]["name"].lower()
                     away = f["teams"]["away"]["name"].lower()
                     league = f["league"]["name"].lower()
-                    # Check if topic mentions any of these teams
-                    if any(word in topic_lower for word in [home.split()[0], away.split()[0], league.split()[0]]):
-                        home_score = f["goals"]["home"]
-                        away_score = f["goals"]["away"]
+                    # Match if any word in topic matches team/league name
+                    topic_words = [w for w in topic_lower.split() if len(w) > 3 and w not in ["versus","match","game","news","latest"]]
+                    if any(word in home or word in away or word in league for word in topic_words):
+                        h_score = f["goals"]["home"]
+                        a_score = f["goals"]["away"]
                         relevant.append(
-                            f"Match: {f['teams']['home']['name']} {home_score} - {away_score} {f['teams']['away']['name']}\n"
+                            f"Match: {f['teams']['home']['name']} {h_score} - {a_score} {f['teams']['away']['name']}\n"
                             f"League: {f['league']['name']}\n"
                             f"Date: {f['fixture']['date'][:10]}\n"
                             f"Status: {f['fixture']['status']['long']}"
                         )
                 if relevant:
-                    logger.info(f"API-Football: found {len(relevant)} relevant fixtures")
+                    logger.info(f"API-Football: {len(relevant)} fixtures for '{topic}'")
                     return "\n\n".join(relevant[:3])
     except Exception as e:
         logger.error(f"API-Football error: {e}")
@@ -279,56 +406,47 @@ async def fetch_football_data(topic: str) -> str:
 
 # ── FETCH FINANCE DATA ──
 async def fetch_finance_data(topic: str) -> str:
-    """Fetch real exchange rates and crypto prices for finance articles."""
-    data_parts = []
-    topic_lower = topic.lower()
+    """Fetch real live rates for finance articles."""
+    parts = []
+    t = topic.lower()
     try:
-        # Dollar/Naira rate from ExchangeRate API (free)
-        if any(w in topic_lower for w in ["dollar","naira","rate","forex","exchange"]):
+        if any(w in t for w in ["dollar","naira","rate","forex","exchange","pound","euro","cbn"]):
             async with httpx.AsyncClient(timeout=8) as client:
                 r = await client.get("https://open.er-api.com/v6/latest/USD")
                 if r.status_code == 200:
                     rates = r.json().get("rates", {})
                     ngn = rates.get("NGN", 0)
-                    gbp_usd = 1 / rates.get("GBP", 1)
-                    eur_usd = 1 / rates.get("EUR", 1)
-                    data_parts.append(
+                    gbp = rates.get("GBP", 1)
+                    eur = rates.get("EUR", 1)
+                    parts.append(
                         f"Live Exchange Rates (Official):\n"
                         f"USD/NGN: ₦{ngn:.2f}\n"
-                        f"GBP/NGN: ₦{ngn * gbp_usd:.2f}\n"
-                        f"EUR/NGN: ₦{ngn * eur_usd:.2f}"
+                        f"GBP/NGN: ₦{ngn/gbp:.2f}\n"
+                        f"EUR/NGN: ₦{ngn/eur:.2f}"
                     )
 
-        # Crypto prices from CoinGecko (free, no key needed)
-        if any(w in topic_lower for w in ["bitcoin","btc","crypto","ethereum","eth","usdt","bnb","solana"]):
+        if any(w in t for w in ["bitcoin","btc","crypto","ethereum","eth","usdt","bnb","solana","sol"]):
             async with httpx.AsyncClient(timeout=8) as client:
                 r = await client.get(
                     "https://api.coingecko.com/api/v3/simple/price",
-                    params={
-                        "ids": "bitcoin,ethereum,tether,binancecoin,solana",
-                        "vs_currencies": "usd,ngn"
-                    }
+                    params={"ids": "bitcoin,ethereum,tether,binancecoin,solana", "vs_currencies": "usd,ngn"}
                 )
                 if r.status_code == 200:
                     prices = r.json()
                     lines = []
-                    if "bitcoin" in prices:
-                        lines.append(f"BTC: ${prices['bitcoin']['usd']:,.0f} / ₦{prices['bitcoin']['ngn']:,.0f}")
-                    if "ethereum" in prices:
-                        lines.append(f"ETH: ${prices['ethereum']['usd']:,.0f} / ₦{prices['ethereum']['ngn']:,.0f}")
-                    if "tether" in prices:
-                        lines.append(f"USDT: ${prices['tether']['usd']:.2f} / ₦{prices['tether']['ngn']:,.0f}")
-                    if "binancecoin" in prices:
-                        lines.append(f"BNB: ${prices['binancecoin']['usd']:,.0f} / ₦{prices['binancecoin']['ngn']:,.0f}")
+                    mapping = [("bitcoin","BTC"),("ethereum","ETH"),("tether","USDT"),("binancecoin","BNB"),("solana","SOL")]
+                    for coin_id, symbol in mapping:
+                        if coin_id in prices:
+                            usd = prices[coin_id].get("usd", 0)
+                            ngn = prices[coin_id].get("ngn", 0)
+                            lines.append(f"{symbol}: ${usd:,.2f} / ₦{ngn:,.0f}")
                     if lines:
-                        data_parts.append("Live Crypto Prices:\n" + "\n".join(lines))
-
+                        parts.append("Live Crypto Prices:\n" + "\n".join(lines))
     except Exception as e:
         logger.error(f"Finance data error: {e}")
+    return "\n\n".join(parts)
 
-    return "\n\n".join(data_parts)
-
-# ── IMAGE FETCH ──
+# ── IMAGE ──
 async def fetch_image(query: str, category: str) -> str:
     fallbacks = {
         "entertainment": "https://images.unsplash.com/photo-1493225457124-a3eb161ffa5f?w=900&q=80",
@@ -378,31 +496,32 @@ def slugify(text: str) -> str:
 # ── AI WRITER ──
 async def generate_article(topic: str, category: str, real_data: str = "") -> dict:
     cat_context = CAT_PROMPTS.get(category, "Nigerian news")
+    data_section = f"\n\nREAL DATA TO USE:\n{real_data}\n\nOnly use facts from this data. Do not invent statistics." if real_data else ""
 
-    data_section = ""
-    if real_data:
-        data_section = f"\n\nREAL DATA TO USE IN YOUR ARTICLE:\n{real_data}\n\nUse these real facts in the article. Do not make up statistics or figures."
+    extra_instructions = ""
+    if category == "football":
+        extra_instructions = "\nFor football: include match result, scoreline, goal scorers, key moments, player ratings (1-10), and match stats if provided in the real data."
+    elif category == "finance":
+        extra_instructions = "\nFor finance: include the exact rates/prices provided in real data. Explain what these rates mean for Nigerians practically."
 
     prompt = f"""You are a Nigerian news journalist writing for NaijaFlash, Nigeria's fastest news blog.
 
-Write a complete, SEO-optimized news article about: {topic}
-Category: {cat_context}{data_section}
+Topic trending in Nigeria right now: {topic}
+Category: {cat_context}{data_section}{extra_instructions}
 
-STYLE RULES:
-- Write in clear, simple English that everyday Nigerians understand
-- Direct, punchy sentences — no unnecessary grammar
-- Use Nigerian context, naira prices, local references where relevant
-- Sound like a real journalist, not AI
-- Only include facts you are confident about — do not fabricate statistics
-- For football: include match stats, player ratings, goal details if data is provided
-- For finance: include real figures if provided
-- Minimum 400 words. Include 2-3 subheadings.
+RULES:
+- Write in clear simple English Nigerians understand
+- Only state facts you are sure of — never fabricate scores, statistics, or quotes
+- If real data is provided, base the article on it
+- If no real data, write a general informational article about the topic
+- Minimum 400 words, 2-3 subheadings
+- Nigerian context and naira prices where relevant
 
-OUTPUT FORMAT — return ONLY this JSON, no markdown, no explanation:
+Return ONLY this JSON, no markdown, no explanation:
 {{
-  "title": "SEO headline max 80 chars with main keyword",
-  "excerpt": "2-sentence summary for SEO meta description",
-  "body": "Full article HTML using only <p><h2><h3><ul><li><strong> tags",
+  "title": "SEO headline max 80 chars",
+  "excerpt": "2-sentence SEO summary",
+  "body": "Full HTML article using only <p><h2><h3><ul><li><strong>",
   "image_query": "3-word image search query"
 }}"""
 
@@ -413,11 +532,11 @@ OUTPUT FORMAT — return ONLY this JSON, no markdown, no explanation:
             response = client.chat.completions.create(
                 model="llama-3.3-70b-versatile",
                 messages=[{"role": "user", "content": prompt}],
-                temperature=0.6,
+                temperature=0.5,
                 max_tokens=2500
             )
             text = response.choices[0].message.content.strip()
-            text = text.replace("```json", "").replace("```", "").strip()
+            text = text.replace("```json","").replace("```","").strip()
             return json.loads(text)
         except Exception as e:
             logger.error(f"Groq failed: {e}")
@@ -428,20 +547,12 @@ OUTPUT FORMAT — return ONLY this JSON, no markdown, no explanation:
             async with httpx.AsyncClient(timeout=30) as client:
                 r = await client.post(
                     "https://api.anthropic.com/v1/messages",
-                    headers={
-                        "x-api-key": ANTHROPIC_API_KEY,
-                        "anthropic-version": "2023-06-01",
-                        "content-type": "application/json"
-                    },
-                    json={
-                        "model": "claude-haiku-4-5-20251001",
-                        "max_tokens": 2500,
-                        "messages": [{"role": "user", "content": prompt}]
-                    }
+                    headers={"x-api-key": ANTHROPIC_API_KEY, "anthropic-version": "2023-06-01", "content-type": "application/json"},
+                    json={"model": "claude-haiku-4-5-20251001", "max_tokens": 2500, "messages": [{"role": "user", "content": prompt}]}
                 )
                 data = r.json()
                 text = data["content"][0]["text"].strip()
-                text = text.replace("```json", "").replace("```", "").strip()
+                text = text.replace("```json","").replace("```","").strip()
                 return json.loads(text)
         except Exception as e:
             logger.error(f"Claude fallback failed: {e}")
@@ -450,8 +561,7 @@ OUTPUT FORMAT — return ONLY this JSON, no markdown, no explanation:
 
 # ── TELEGRAM ──
 async def send_to_all_admins(text: str, reply_markup: dict = None):
-    admins = get_all_admins()
-    for chat_id in admins:
+    for chat_id in get_all_admins():
         await send_telegram(chat_id, text, reply_markup)
 
 async def send_telegram(chat_id: int, text: str, reply_markup: dict = None, parse_mode: str = "HTML"):
@@ -462,10 +572,7 @@ async def send_telegram(chat_id: int, text: str, reply_markup: dict = None, pars
         if reply_markup:
             payload["reply_markup"] = json.dumps(reply_markup)
         async with httpx.AsyncClient(timeout=15) as client:
-            r = await client.post(
-                f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
-                json=payload
-            )
+            r = await client.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage", json=payload)
             data = r.json()
             if data.get("ok"):
                 return data["result"]["message_id"]
@@ -476,21 +583,19 @@ async def send_telegram(chat_id: int, text: str, reply_markup: dict = None, pars
 async def send_article_for_approval(article_id: int, title: str, excerpt: str, category: str, topic: str):
     text = (
         f"📰 <b>New Article Ready</b>\n\n"
-        f"<b>Trending Topic:</b> {topic}\n"
+        f"<b>Trending:</b> {topic}\n"
         f"<b>Category:</b> {category.upper()}\n\n"
         f"<b>Title:</b>\n{title}\n\n"
         f"<b>Excerpt:</b>\n{excerpt}\n\n"
         f"<b>ID:</b> #{article_id}"
     )
-    markup = {
-        "inline_keyboard": [[
-            {"text": "✅ Approve", "callback_data": f"approve_{article_id}"},
-            {"text": "❌ Reject", "callback_data": f"reject_{article_id}"}
-        ]]
-    }
+    markup = {"inline_keyboard": [[
+        {"text": "✅ Approve", "callback_data": f"approve_{article_id}"},
+        {"text": "❌ Reject", "callback_data": f"reject_{article_id}"}
+    ]]}
     await send_to_all_admins(text, reply_markup=markup)
 
-# ── MARK TOPIC USED ──
+# ── TOPIC TRACKING ──
 def mark_topic_used(topic: str):
     try:
         conn = get_db()
@@ -500,7 +605,7 @@ def mark_topic_used(topic: str):
         cur.close()
         conn.close()
     except Exception as e:
-        logger.error(f"mark_topic_used error: {e}")
+        logger.error(f"mark_topic_used: {e}")
 
 def is_topic_used(topic: str) -> bool:
     try:
@@ -516,41 +621,34 @@ def is_topic_used(topic: str) -> bool:
 
 # ── MAIN PIPELINE ──
 async def run_pipeline():
-    """
-    Full pipeline:
-    1. Fetch all trending topics in Nigeria from Google Trends
-    2. Filter by our categories
-    3. For each new trend, fetch real data (news/football stats/rates)
-    4. Generate article with real facts
-    5. Send for approval
-    """
-    logger.info("Pipeline started")
+    logger.info("Pipeline v4 started")
     generated = 0
 
     try:
         trends = await fetch_nigeria_trends()
 
         if not trends:
-            await send_to_all_admins("⚠️ No trends fetched from Google Trends. Check connection.")
+            await send_to_all_admins(
+                "⚠️ No relevant trends found in Nigeria right now.\n"
+                "Google Trends may be slow or all current trends don't match our categories."
+            )
             return
 
         new_trends = [t for t in trends if not is_topic_used(t["topic"])]
-        logger.info(f"Found {len(trends)} trends, {len(new_trends)} are new")
+        logger.info(f"{len(trends)} valid trends, {len(new_trends)} new")
 
         if not new_trends:
-            await send_to_all_admins("ℹ️ All current trending topics already covered. Try again later.")
+            await send_to_all_admins("ℹ️ All trending topics already covered. Try again later when new trends appear.")
             return
 
-        # Process up to 3 new trends per run to avoid spamming
+        # Process up to 3 per run
         for trend in new_trends[:3]:
             topic = trend["topic"]
             category = trend["category"]
-
             try:
-                logger.info(f"Processing: [{category}] {topic}")
+                logger.info(f"Processing [{category}]: {topic}")
                 real_data = ""
 
-                # Fetch real data based on category
                 if category == "football":
                     football_data = await fetch_football_data(topic)
                     news_data = await fetch_news_context(topic)
@@ -562,11 +660,9 @@ async def run_pipeline():
                 else:
                     real_data = await fetch_news_context(topic)
 
-                # Generate article
                 article_data = await generate_article(topic, category, real_data)
                 image_url = await fetch_image(article_data.get("image_query", topic), category)
 
-                # Save to DB
                 slug = slugify(article_data["title"])
                 conn = get_db()
                 cur = conn.cursor()
@@ -580,22 +676,18 @@ async def run_pipeline():
                 conn.close()
 
                 mark_topic_used(topic)
-
                 await send_article_for_approval(article_id, article_data["title"], article_data.get("excerpt",""), category, topic)
                 generated += 1
-                logger.info(f"Article #{article_id} sent for approval: {article_data['title']}")
-
-                # Small delay between articles
                 await asyncio.sleep(2)
 
             except Exception as e:
-                logger.error(f"Error processing trend '{topic}': {e}")
+                logger.error(f"Error on '{topic}': {e}")
                 continue
 
         if generated == 0:
-            await send_to_all_admins("⚠️ Pipeline ran but no articles were generated. Check logs.")
+            await send_to_all_admins("⚠️ Pipeline ran but failed to generate articles. Check Railway logs.")
         else:
-            logger.info(f"Pipeline complete. {generated} articles generated.")
+            logger.info(f"Pipeline done. {generated} articles generated.")
 
     except Exception as e:
         logger.error(f"Pipeline error: {e}")
@@ -605,11 +697,11 @@ async def run_pipeline():
 @app.on_event("startup")
 async def startup():
     init_db()
-    logger.info("NaijaFlash backend v3 started")
+    logger.info("NaijaFlash v4 started")
 
 @app.get("/")
 async def root():
-    return {"status": "NaijaFlash API running", "version": "3.0.0"}
+    return {"status": "NaijaFlash API running", "version": "4.0.0"}
 
 @app.get("/api/articles")
 async def get_articles(category: Optional[str] = None, limit: int = 20, offset: int = 0):
@@ -678,13 +770,7 @@ async def get_stats():
     recent = cur.fetchall()
     cur.close()
     conn.close()
-    return {
-        "total_published": total,
-        "pending_approval": pending,
-        "total_views": views,
-        "by_category": [dict(r) for r in by_cat],
-        "recent": [dict(r) for r in recent]
-    }
+    return {"total_published": total, "pending_approval": pending, "total_views": views, "by_category": [dict(r) for r in by_cat], "recent": [dict(r) for r in recent]}
 
 @app.post("/api/pipeline/run")
 async def trigger_pipeline(background_tasks: BackgroundTasks):
@@ -703,13 +789,16 @@ async def health():
     except:
         db_ok = False
     return {
-        "status": "ok",
+        "status": "ok", "version": "4.0.0",
         "db": "connected" if db_ok else "error",
-        "groq": "configured" if GROQ_API_KEY else "not set",
-        "claude": "configured" if ANTHROPIC_API_KEY else "not set",
-        "telegram": "configured" if TELEGRAM_BOT_TOKEN else "not set",
-        "news_api": "configured" if NEWS_API_KEY else "not set",
-        "api_football": "configured" if API_FOOTBALL_KEY else "not set"
+        "groq": "✅" if GROQ_API_KEY else "❌",
+        "claude": "✅" if ANTHROPIC_API_KEY else "❌",
+        "telegram": "✅" if TELEGRAM_BOT_TOKEN else "❌",
+        "gnews": "✅" if GNEWS_API_KEY else "❌",
+        "newsapi": "✅" if NEWS_API_KEY else "❌",
+        "api_football": "✅" if API_FOOTBALL_KEY else "❌",
+        "unsplash": "✅" if UNSPLASH_ACCESS_KEY else "❌",
+        "pexels": "✅" if PEXELS_API_KEY else "❌",
     }
 
 @app.post("/api/telegram/webhook")
@@ -719,12 +808,10 @@ async def telegram_webhook(request: Request):
 
         if "callback_query" in data:
             cb = data["callback_query"]
-            cb_data = cb.get("data", "")
+            cb_data = cb.get("data","")
             user_id = cb["from"]["id"]
-
             if not is_admin(user_id):
                 return {"ok": True}
-
             if cb_data.startswith("approve_"):
                 article_id = int(cb_data.split("_")[1])
                 conn = get_db()
@@ -735,7 +822,6 @@ async def telegram_webhook(request: Request):
                 cur.close()
                 conn.close()
                 await send_to_all_admins(f"✅ Published: {row['title'] if row else 'Article'}")
-
             elif cb_data.startswith("reject_"):
                 article_id = int(cb_data.split("_")[1])
                 conn = get_db()
@@ -745,16 +831,12 @@ async def telegram_webhook(request: Request):
                 cur.close()
                 conn.close()
                 await send_to_all_admins(f"❌ Article #{article_id} rejected.")
-
             async with httpx.AsyncClient() as client:
-                await client.post(
-                    f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/answerCallbackQuery",
-                    json={"callback_query_id": cb["id"]}
-                )
+                await client.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/answerCallbackQuery", json={"callback_query_id": cb["id"]})
 
         elif "message" in data:
             msg = data["message"]
-            text = msg.get("text", "").strip()
+            text = msg.get("text","").strip()
             chat_id = msg["chat"]["id"]
             user_id = msg["from"]["id"]
 
@@ -764,19 +846,27 @@ async def telegram_webhook(request: Request):
             elif text == "/help":
                 cmd = (
                     "🤖 <b>NaijaFlash Bot Commands</b>\n\n"
-                    "/stats — View blog statistics\n"
-                    "/generate — Fetch trends & generate articles now\n"
+                    "/stats — Blog statistics\n"
+                    "/trends — See what's trending in Nigeria now\n"
+                    "/generate — Generate articles from trends\n"
                     "/pending — View pending articles\n"
                     "/help — Show this message"
                 )
                 if is_owner(user_id):
-                    cmd += (
-                        "\n\n👑 <b>Owner Commands</b>\n"
-                        "/addadmin [chat_id] — Add new admin\n"
-                        "/removeadmin [chat_id] — Remove admin\n"
-                        "/listadmins — List all admins"
-                    )
+                    cmd += "\n\n👑 <b>Owner Commands</b>\n/addadmin [chat_id]\n/removeadmin [chat_id]\n/listadmins"
                 await send_telegram(chat_id, cmd)
+
+            elif text == "/trends":
+                if not is_admin(user_id):
+                    await send_telegram(chat_id, "⛔ Admins only.")
+                    return {"ok": True}
+                await send_telegram(chat_id, "🔍 Fetching Nigeria trends...")
+                trends = await fetch_nigeria_trends()
+                if not trends:
+                    await send_telegram(chat_id, "No relevant trends found right now.")
+                else:
+                    lines = "\n".join([f"• [{t['category'].upper()}] {t['topic']}" for t in trends])
+                    await send_telegram(chat_id, f"🇳🇬 <b>Trending in Nigeria Now</b>\n\n{lines}")
 
             elif text == "/stats":
                 if not is_admin(user_id):
@@ -796,11 +886,7 @@ async def telegram_webhook(request: Request):
                 conn.close()
                 cat_lines = "\n".join([f"  • {r['category']}: {r['c']}" for r in cats]) or "  None yet"
                 await send_telegram(chat_id,
-                    f"📊 <b>NaijaFlash Stats</b>\n\n"
-                    f"✅ Published: {pub}\n"
-                    f"⏳ Pending: {pend}\n"
-                    f"👁 Total Views: {views}\n\n"
-                    f"<b>By Category:</b>\n{cat_lines}"
+                    f"📊 <b>NaijaFlash Stats</b>\n\n✅ Published: {pub}\n⏳ Pending: {pend}\n👁 Total Views: {views}\n\n<b>By Category:</b>\n{cat_lines}"
                 )
 
             elif text == "/generate":
@@ -828,7 +914,7 @@ async def telegram_webhook(request: Request):
 
             elif text.startswith("/addadmin"):
                 if not is_owner(user_id):
-                    await send_telegram(chat_id, "⛔ Only the owner can add admins.")
+                    await send_telegram(chat_id, "⛔ Owner only.")
                     return {"ok": True}
                 parts = text.split()
                 if len(parts) < 2:
@@ -842,14 +928,14 @@ async def telegram_webhook(request: Request):
                     conn.commit()
                     cur.close()
                     conn.close()
-                    await send_telegram(chat_id, f"✅ Admin {new_id} added successfully.")
-                    await send_telegram(new_id, "🎉 You have been added as a NaijaFlash admin! Send /help to get started.")
+                    await send_telegram(chat_id, f"✅ Admin {new_id} added.")
+                    await send_telegram(new_id, "🎉 You've been added as a NaijaFlash admin! Send /help to get started.")
                 except Exception as e:
                     await send_telegram(chat_id, f"❌ Error: {e}")
 
             elif text.startswith("/removeadmin"):
                 if not is_owner(user_id):
-                    await send_telegram(chat_id, "⛔ Only the owner can remove admins.")
+                    await send_telegram(chat_id, "⛔ Owner only.")
                     return {"ok": True}
                 parts = text.split()
                 if len(parts) < 2:
