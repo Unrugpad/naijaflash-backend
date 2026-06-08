@@ -318,125 +318,117 @@ async def fetch_nigeria_trends() -> List[dict]:
 
     return trends
 
-# ── SMART NEWS SEARCH ──
-def build_smart_queries(topic: str, category: str) -> List[str]:
-    """
-    Build multiple smart search queries for a topic.
-    For football matches, search for result first.
-    """
+# ── TAVILY SEARCH ──
+TAVILY_API_KEY = os.getenv("TAVILY_API_KEY")
+
+def build_search_query(topic: str, category: str) -> str:
+    """Build the best search query for a topic based on category."""
     t = topic.lower()
-    queries = []
+    year = datetime.now().year
 
     if category == "football":
-        # Check if it's a match (vs pattern)
         if re.search(r'\bvs?\b', t) or ' v ' in t:
-            year = datetime.now().year
-            queries = [
-                f"{topic} result {year}",
-                f"{topic} score goals",
-                f"{topic} match report",
-            ]
+            return f"{topic} result score goals {year}"
         else:
-            # Player or team topic
-            queries = [
-                f"{topic} latest news {datetime.now().year}",
-                f"{topic} today",
-                f"{topic}",
-            ]
+            return f"{topic} football news {year}"
     elif category == "finance":
-        queries = [
-            f"{topic} today rate naira",
-            f"{topic} Nigeria {datetime.now().year}",
-            f"{topic}",
-        ]
+        return f"{topic} Nigeria rate naira {year}"
     elif category == "education":
-        queries = [
-            f"{topic} Nigeria {datetime.now().year}",
-            f"{topic} latest update",
-            f"{topic}",
-        ]
+        return f"{topic} Nigeria {year}"
     else:
-        queries = [
-            f"{topic} Nigeria {datetime.now().year}",
-            f"{topic} latest",
-            f"{topic}",
-        ]
-
-    return queries
-
-async def search_gnews(query: str) -> List[dict]:
-    if not GNEWS_API_KEY:
-        return []
-    try:
-        async with httpx.AsyncClient(timeout=10) as client:
-            r = await client.get(
-                "https://gnews.io/api/v4/search",
-                params={"q": query, "lang": "en", "max": 5, "token": GNEWS_API_KEY,
-                        "sortby": "publishedAt"}
-            )
-            if r.status_code == 200:
-                return r.json().get("articles", [])
-    except Exception as e:
-        logger.info(f"GNews error: {e}")
-    return []
-
-async def search_newsapi(query: str) -> List[dict]:
-    if not NEWS_API_KEY:
-        return []
-    try:
-        async with httpx.AsyncClient(timeout=10) as client:
-            r = await client.get(
-                "https://newsapi.org/v2/everything",
-                params={"q": query, "language": "en", "sortBy": "publishedAt",
-                        "pageSize": 5, "apiKey": NEWS_API_KEY}
-            )
-            if r.status_code == 200:
-                articles = r.json().get("articles", [])
-                return [a for a in articles if a.get('title') and '[Removed]' not in a.get('title','')]
-    except Exception as e:
-        logger.info(f"NewsAPI error: {e}")
-    return []
-
-def format_articles(articles: List[dict]) -> str:
-    summaries = []
-    for a in articles[:5]:
-        title = a.get('title','').strip()
-        source = a.get('source',{}).get('name','') if isinstance(a.get('source'), dict) else ''
-        desc = a.get('description','') or a.get('content','') or ''
-        pub = a.get('publishedAt','') or a.get('publishedAt','')
-        if title:
-            summaries.append(f"Headline: {title}\nSource: {source}\nPublished: {pub[:10]}\nSummary: {desc[:300]}")
-    return "\n\n".join(summaries)
+        return f"{topic} Nigeria {year}"
 
 async def fetch_news_context(topic: str, category: str = "news") -> str:
     """
-    Fetch real current news using smart queries.
-    Tries multiple query variations to get the most accurate/recent data.
+    Fetch real current news using Tavily — live Google search results.
+    Falls back to GNews/NewsAPI if Tavily not available.
     """
-    queries = build_smart_queries(topic, category)
-    best_articles = []
+    query = build_search_query(topic, category)
 
-    for query in queries:
-        # Try GNews
-        articles = await search_gnews(query)
-        if articles:
-            best_articles = articles
-            logger.info(f"GNews hit: '{query}' → {len(articles)} articles")
-            break
+    # ── Tavily (primary) ──
+    if TAVILY_API_KEY:
+        try:
+            async with httpx.AsyncClient(timeout=15) as client:
+                r = await client.post(
+                    "https://api.tavily.com/search",
+                    json={
+                        "api_key": TAVILY_API_KEY,
+                        "query": query,
+                        "search_depth": "basic",
+                        "max_results": 5,
+                        "include_answer": True,
+                        "include_raw_content": False,
+                    }
+                )
+                if r.status_code == 200:
+                    data = r.json()
+                    parts = []
 
-    # If GNews found nothing, try NewsAPI
-    if not best_articles:
-        for query in queries:
-            articles = await search_newsapi(query)
-            if articles:
-                best_articles = articles
-                logger.info(f"NewsAPI hit: '{query}' → {len(articles)} articles")
-                break
+                    # Include Tavily's auto-generated answer summary if available
+                    answer = data.get("answer", "")
+                    if answer:
+                        parts.append(f"Summary: {answer}")
 
-    if best_articles:
-        return format_articles(best_articles)
+                    # Include individual search results
+                    results = data.get("results", [])
+                    for res in results[:5]:
+                        title = res.get("title", "")
+                        url = res.get("url", "")
+                        content = res.get("content", "")[:400]
+                        if title:
+                            parts.append(f"Source: {title}\nURL: {url}\nContent: {content}")
 
-    logger.info(f"No news found for topic: {topic}")
+                    if parts:
+                        logger.info(f"Tavily: {len(results)} results for '{query}'")
+                        return "\n\n".join(parts)
+        except Exception as e:
+            logger.error(f"Tavily error: {e}")
+
+    # ── GNews fallback ──
+    if GNEWS_API_KEY:
+        try:
+            async with httpx.AsyncClient(timeout=10) as client:
+                r = await client.get(
+                    "https://gnews.io/api/v4/search",
+                    params={"q": query, "lang": "en", "max": 5,
+                            "token": GNEWS_API_KEY, "sortby": "publishedAt"}
+                )
+                if r.status_code == 200:
+                    articles = r.json().get("articles", [])
+                    if articles:
+                        summaries = [
+                            f"Headline: {a.get('title','')}\nSource: {a.get('source',{}).get('name','')}\nPublished: {a.get('publishedAt','')[:10]}\nSummary: {a.get('description','')[:300]}"
+                            for a in articles[:5] if a.get('title')
+                        ]
+                        if summaries:
+                            logger.info(f"GNews fallback: {len(summaries)} for '{query}'")
+                            return "\n\n".join(summaries)
+        except Exception as e:
+            logger.info(f"GNews error: {e}")
+
+    # ── NewsAPI fallback ──
+    if NEWS_API_KEY:
+        try:
+            async with httpx.AsyncClient(timeout=10) as client:
+                r = await client.get(
+                    "https://newsapi.org/v2/everything",
+                    params={"q": query, "language": "en", "sortBy": "publishedAt",
+                            "pageSize": 5, "apiKey": NEWS_API_KEY}
+                )
+                if r.status_code == 200:
+                    articles = r.json().get("articles", [])
+                    clean = [a for a in articles if a.get('title') and '[Removed]' not in a.get('title','')]
+                    if clean:
+                        summaries = [
+                            f"Headline: {a.get('title','')}\nSource: {a.get('source',{}).get('name','')}\nPublished: {a.get('publishedAt','')[:10]}\nSummary: {a.get('description','')[:300]}"
+                            for a in clean[:5]
+                        ]
+                        logger.info(f"NewsAPI fallback: {len(summaries)} for '{query}'")
+                        return "\n\n".join(summaries)
+        except Exception as e:
+            logger.info(f"NewsAPI error: {e}")
+
+    logger.info(f"No news context found for: {topic}")
     return ""
 
 # ── FETCH FOOTBALL DATA ──
@@ -916,6 +908,7 @@ async def health():
         "telegram": "✅" if TELEGRAM_BOT_TOKEN else "❌",
         "gnews": "✅" if GNEWS_API_KEY else "❌",
         "newsapi": "✅" if NEWS_API_KEY else "❌",
+        "tavily": "✅" if TAVILY_API_KEY else "❌",
         "api_football": "✅" if API_FOOTBALL_KEY else "❌",
         "unsplash": "✅" if UNSPLASH_ACCESS_KEY else "❌",
         "pexels": "✅" if PEXELS_API_KEY else "❌",
