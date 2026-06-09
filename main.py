@@ -748,11 +748,123 @@ def is_topic_used(topic: str) -> bool:
     except:
         return False
 
+# ── EVERGREEN FALLBACK TOPICS ──
+# Used when a category has no trending topics from Google Trends
+EVERGREEN_TOPICS = {
+    "finance": [
+        "Dollar to Naira black market rate today",
+        "USDT to Naira rate today Binance P2P",
+        "How to make money online in Nigeria 2026",
+        "Bitcoin price in Naira today",
+        "Best investment apps in Nigeria 2026",
+        "How to save money in Nigeria",
+        "CBN dollar rate today official",
+        "How to send money abroad from Nigeria",
+        "Best fintech apps Nigeria 2026",
+        "Ethereum price naira today",
+    ],
+    "education": [
+        "JAMB portal mop-up registration 2026",
+        "WAEC 2026 timetable and exam dates",
+        "How to check JAMB result 2026",
+        "Post UTME screening dates 2026",
+        "Scholarship opportunities for Nigerians 2026",
+        "NYSC 2026 mobilization update",
+        "How to apply for federal university admission",
+        "NECO 2026 examination timetable",
+        "Best universities in Nigeria 2026 ranking",
+        "Jobs for Nigerian graduates 2026",
+    ],
+    "health": [
+        "Malaria symptoms and treatment Nigeria",
+        "How to treat typhoid fever in Nigeria",
+        "Best medication for stomach ulcer Nigeria",
+        "High blood pressure remedies for Nigerians",
+        "How to know if you have diabetes Nigeria",
+        "Best hospitals in Lagos Nigeria",
+        "How to boost immune system naturally Nigeria",
+        "Causes of frequent headache and treatment",
+        "How to lose weight fast Nigeria",
+        "Symptoms of kidney disease in Nigeria",
+    ],
+    "entertainment": [
+        "Best Nollywood movies to watch 2026",
+        "Davido latest news and music 2026",
+        "Burna Boy latest album and tour 2026",
+        "Top Nigerian musicians 2026",
+        "BBNaija 2026 latest update",
+        "Wizkid new song 2026",
+        "Best Nigerian movies on Netflix 2026",
+        "Asake latest music and concert",
+        "Rema latest news and music",
+        "Top Afrobeats songs 2026",
+    ],
+    "tech": [
+        "Best smartphones under 200000 naira 2026",
+        "iPhone 16 price in Nigeria",
+        "Tecno Camon 40 price and specs Nigeria",
+        "Best data plan in Nigeria 2026 MTN Airtel Glo",
+        "Samsung Galaxy A55 price Nigeria",
+        "How to make money with your phone Nigeria",
+        "Best laptops under 500000 naira 2026",
+        "How to start a tech business in Nigeria",
+        "Infinix Note 40 price and review Nigeria",
+        "Best VPN for Nigeria 2026",
+    ],
+    "news": [
+        "Nigeria fuel price update today 2026",
+        "Tinubu government latest policy Nigeria",
+        "Nigeria economy news today",
+        "Cost of living in Nigeria 2026",
+        "Nigeria electricity tariff update 2026",
+        "Lagos traffic and infrastructure news",
+        "Nigeria security news today",
+        "Nigerian government palliative update",
+        "Nigeria immigration and visa news 2026",
+        "EFCC latest arrest and news Nigeria",
+    ],
+    "football": [
+        "Super Eagles 2026 World Cup squad",
+        "Victor Osimhen latest news and goals",
+        "Premier League results this week",
+        "Champions League latest results",
+        "Nigeria vs latest match report",
+        "Ademola Lookman latest news",
+        "AFCON 2025 Nigeria latest update",
+        "Premier League top scorer 2026",
+        "Real Madrid vs Barcelona latest",
+        "Nigerian players abroad latest news",
+    ],
+}
+
+def get_fallback_topic(category: str) -> Optional[dict]:
+    """Get an unused evergreen topic for a category."""
+    topics = EVERGREEN_TOPICS.get(category, [])
+    if not topics:
+        return None
+    # Shuffle to avoid always picking same topic
+    random.shuffle(topics)
+    for topic in topics:
+        if not is_topic_used(topic):
+            return {"topic": topic, "category": category, "source": "evergreen"}
+    # All used — reset evergreen topics for this category
+    try:
+        conn = get_db()
+        cur = conn.cursor()
+        for topic in topics:
+            cur.execute("DELETE FROM used_topics WHERE topic=%s", (topic,))
+        conn.commit()
+        cur.close()
+        conn.close()
+    except Exception as e:
+        logger.error(f"Evergreen reset error: {e}")
+    return {"topic": random.choice(topics), "category": category, "source": "evergreen"}
+
 # ── MAIN PIPELINE ──
 async def run_pipeline(force_category: str = None):
     """
     Pipeline with optional category filter.
-    force_category: if set, only process trends from that category.
+    Falls back to evergreen topics when nothing is trending for a category.
     """
     label = f"[{force_category.upper()}]" if force_category else "[ALL]"
     logger.info(f"Pipeline {label} started")
@@ -761,30 +873,47 @@ async def run_pipeline(force_category: str = None):
     try:
         trends = await fetch_nigeria_trends()
 
-        if not trends:
-            await send_to_all_admins("⚠️ No relevant trends found in Nigeria right now.")
-            return
-
         # Filter by forced category if specified
         if force_category:
-            trends = [t for t in trends if t["category"] == force_category]
-            if not trends:
+            cat_trends = [t for t in trends if t["category"] == force_category]
+            new_cat_trends = [t for t in cat_trends if not is_topic_used(t["topic"])]
+
+            if new_cat_trends:
+                # Use trending topics
+                selected = new_cat_trends[:3]
+                logger.info(f"Using {len(selected)} trending topics for {force_category}")
+            else:
+                # Fall back to evergreen
+                fallback = get_fallback_topic(force_category)
+                if not fallback:
+                    await send_to_all_admins(f"⚠️ No topics available for <b>{force_category.upper()}</b>.")
+                    return
+                selected = [fallback]
+                logger.info(f"Using evergreen fallback for {force_category}: {fallback['topic']}")
                 await send_to_all_admins(
-                    f"ℹ️ No trending topics found for <b>{force_category.upper()}</b> right now.\n"
-                    f"Try /trends to see what's currently trending."
+                    f"ℹ️ No trending topics for <b>{force_category.upper()}</b> right now.\n"
+                    f"Using evergreen topic: <i>{fallback['topic']}</i>"
                 )
-                return
+        else:
+            # All categories — use trending + fill gaps with evergreen
+            new_trends = [t for t in trends if not is_topic_used(t["topic"])]
+            if new_trends:
+                selected = new_trends[:3]
+            else:
+                # Nothing trending — pick one evergreen from a random category
+                cat = random.choice(CATEGORIES)
+                fallback = get_fallback_topic(cat)
+                if not fallback:
+                    await send_to_all_admins("ℹ️ All topics already covered. Try again later.")
+                    return
+                selected = [fallback]
+                await send_to_all_admins(
+                    f"ℹ️ No new trending topics right now.\n"
+                    f"Using evergreen topic: <i>{fallback['topic']}</i>"
+                )
 
-        new_trends = [t for t in trends if not is_topic_used(t["topic"])]
-        logger.info(f"{len(trends)} valid trends, {len(new_trends)} new")
-
-        if not new_trends:
-            cat_msg = f" in <b>{force_category.upper()}</b>" if force_category else ""
-            await send_to_all_admins(f"ℹ️ All trending topics{cat_msg} already covered. Try again later.")
-            return
-
-        # Process up to 3 per run
-        for trend in new_trends[:3]:
+        # Process selected topics
+        for trend in selected:
             topic = trend["topic"]
             category = trend["category"]
             try:
@@ -818,7 +947,10 @@ async def run_pipeline(force_category: str = None):
                 conn.close()
 
                 mark_topic_used(topic)
-                await send_article_for_approval(article_id, article_data["title"], article_data.get("excerpt",""), category, topic)
+                await send_article_for_approval(
+                    article_id, article_data["title"],
+                    article_data.get("excerpt",""), category, topic
+                )
                 generated += 1
                 await asyncio.sleep(2)
 
@@ -830,6 +962,10 @@ async def run_pipeline(force_category: str = None):
             await send_to_all_admins("⚠️ Pipeline ran but failed to generate articles. Check Railway logs.")
         else:
             logger.info(f"Pipeline {label} done. {generated} articles generated.")
+
+    except Exception as e:
+        logger.error(f"Pipeline error: {e}")
+        await send_to_all_admins(f"⚠️ Pipeline error: {str(e)[:200]}")
 
     except Exception as e:
         logger.error(f"Pipeline error: {e}")
