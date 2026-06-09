@@ -32,6 +32,7 @@ PEXELS_API_KEY = os.getenv("PEXELS_API_KEY")
 NEWS_API_KEY = os.getenv("NEWS_API_KEY")
 API_FOOTBALL_KEY = os.getenv("API_FOOTBALL_KEY")
 GNEWS_API_KEY = os.getenv("GNEWS_API_KEY")
+TAVILY_API_KEY = os.getenv("TAVILY_API_KEY")
 
 CATEGORIES = ["entertainment", "finance", "tech", "health", "education", "news", "football"]
 
@@ -336,7 +337,6 @@ async def fetch_nigeria_trends() -> List[dict]:
     return trends
 
 # ── TAVILY SEARCH ──
-TAVILY_API_KEY = os.getenv("TAVILY_API_KEY")
 
 def build_search_query(topic: str, category: str) -> str:
     """Build the best search query for a topic based on category."""
@@ -611,46 +611,93 @@ def slugify(text: str) -> str:
     return text[:80] + '-' + str(int(datetime.now().timestamp()))[-6:]
 
 # ── AI WRITER ──
-async def generate_article(topic: str, category: str, real_data: str = "") -> dict:
+def is_article_quality_ok(article: dict) -> tuple:
+    """
+    Basic quality check before sending to Telegram.
+    Returns (ok: bool, reason: str)
+    """
+    title = article.get("title", "")
+    excerpt = article.get("excerpt", "")
+    body = article.get("body", "")
+
+    # Title too short
+    if len(title) < 15:
+        return False, f"Title too short: '{title}'"
+
+    # Suspicious phrases indicating AI had no real data and fabricated
+    bad_phrases = [
+        "not mentioned", "not reported", "no data", "not available",
+        "i cannot", "i don't have", "as of my knowledge",
+        "i'm not sure", "it is unclear", "cannot confirm",
+        "no information", "not confirmed", "unverified"
+    ]
+    combined = (title + " " + excerpt + " " + body).lower()
+    for phrase in bad_phrases:
+        if phrase in combined:
+            return False, f"AI admitted uncertainty: '{phrase}' found in content"
+
+    # Body too short
+    if len(body) < 200:
+        return False, "Article body too short"
+
+    return True, "ok"
+
+async def generate_article(topic: str, category: str, real_data: str = "", is_evergreen: bool = False) -> dict:
     cat_context = CAT_PROMPTS.get(category, "Nigerian news")
-    data_section = f"\n\nREAL DATA TO USE:\n{real_data}\n\nOnly use facts from this data. Do not invent statistics." if real_data else ""
+
+    if real_data:
+        data_section = f"\n\nVERIFIED REAL DATA — USE THIS:\n{real_data}\n\nIMPORTANT: Base your article on this data only. Do not add statistics or facts not in this data."
+    else:
+        data_section = "\n\nNO REAL-TIME DATA AVAILABLE. Write a helpful, accurate general guide on this topic based on your knowledge. Be clear this is general information, not breaking news."
 
     extra_instructions = ""
     if category == "football":
         extra_instructions = (
             "\nFOOTBALL RULES:"
-            "\n- If real data shows a COMPLETED match: write in PAST TENSE, include exact scoreline, goalscorers, minute of goals, player ratings (1-10), key moments"
-            "\n- If real data shows an UPCOMING match: write in FUTURE TENSE as a preview, include team form, key players, prediction"
-            "\n- NEVER write about a match as upcoming if the real data shows it already happened"
-            "\n- Include a proper descriptive headline — not just 'Team A vs Team B'"
-            "\n- Example good title: 'Michael Olise Hat-Trick Fires France Past Northern Ireland 3-1'"
+            "\n- If real data shows a COMPLETED match: write in PAST TENSE, include exact scoreline, goalscorers with minutes, player ratings 1-10, key moments"
+            "\n- If real data shows an UPCOMING match: write FUTURE TENSE preview, include team form, key players to watch, prediction"
+            "\n- NEVER describe a completed match as upcoming or vice versa"
+            "\n- Write a descriptive headline e.g. 'Mbappé Hat-Trick Fires France Past Nigeria 3-0' not just 'France vs Nigeria'"
+            "\n- NEVER fabricate scorelines, goalscorers, or match stats not in the real data"
         )
     elif category == "finance":
         extra_instructions = (
             "\nFINANCE RULES:"
-            "\n- Use the exact rates provided in real data — do not guess or estimate"
-            "\n- Explain what the rate means practically for Nigerians (e.g. what ₦50,000 buys in USD)"
-            "\n- Include comparison to previous week/month if available"
+            "\n- Use ONLY the exact rates in the real data — never guess or round up figures"
+            "\n- If no live rate is provided, say 'rates vary — check your exchange platform'"
+            "\n- Explain what the rate means for Nigerians practically"
+            "\n- Never state a specific naira rate as fact unless it appears in the real data provided"
+        )
+    elif category == "health":
+        extra_instructions = (
+            "\nHEALTH RULES:"
+            "\n- Always include a disclaimer: 'Consult a doctor before taking any medication'"
+            "\n- Drug prices must be stated as approximate and subject to change"
+            "\n- Never recommend specific dosages — direct readers to a pharmacist or doctor"
         )
 
-    prompt = f"""You are a Nigerian news journalist writing for NaijaFlash, Nigeria's fastest news blog.
+    source_note = "This is an evergreen guide on a topic Nigerians frequently search." if is_evergreen else "This topic is currently trending in Nigeria."
 
-Topic trending in Nigeria right now: {topic}
-Category: {cat_context}{data_section}{extra_instructions}
+    prompt = f"""You are a senior Nigerian journalist writing for NaijaFlash, Nigeria's most trusted news blog.
 
-RULES:
-- Write in clear simple English Nigerians understand
-- Only state facts you are sure of — never fabricate scores, statistics, or quotes
-- If real data is provided, base the article on it
-- If no real data, write a general informational article about the topic
-- Minimum 400 words, 2-3 subheadings
-- Nigerian context and naira prices where relevant
+Topic: {topic}
+Category: {cat_context}
+Context: {source_note}{data_section}{extra_instructions}
 
-Return ONLY this JSON, no markdown, no explanation:
+STRICT RULES:
+1. NEVER fabricate statistics, scores, prices, or quotes not in the real data
+2. NEVER write phrases like "as of my knowledge cutoff" or "I cannot confirm" — if unsure, write general guidance
+3. Write in clear simple English Nigerians understand — no grammar competition
+4. Minimum 400 words, 2-3 subheadings using <h2> tags
+5. Nigerian context throughout — mention naira prices, local brands, Nigerian cities where relevant
+6. For guides/evergreen: be practical, specific, actionable
+7. For news/match reports: be factual, based only on provided real data
+
+Return ONLY this JSON — no markdown, no explanation, no preamble:
 {{
-  "title": "SEO headline max 80 chars",
-  "excerpt": "2-sentence SEO summary",
-  "body": "Full HTML article using only <p><h2><h3><ul><li><strong>",
+  "title": "Compelling SEO headline, max 80 chars, includes main keyword",
+  "excerpt": "2 clear sentences summarising the article for SEO and social sharing",
+  "body": "Complete article HTML using only <p> <h2> <h3> <ul> <li> <strong> tags",
   "image_query": "3-word image search query"
 }}"""
 
@@ -661,11 +708,15 @@ Return ONLY this JSON, no markdown, no explanation:
             response = client.chat.completions.create(
                 model="llama-3.3-70b-versatile",
                 messages=[{"role": "user", "content": prompt}],
-                temperature=0.5,
+                temperature=0.4,
                 max_tokens=2500
             )
             text = response.choices[0].message.content.strip()
             text = text.replace("```json","").replace("```","").strip()
+            # Find JSON in response in case there's extra text
+            match = re.search(r'\{.*\}', text, re.DOTALL)
+            if match:
+                text = match.group(0)
             return json.loads(text)
         except Exception as e:
             logger.error(f"Groq failed: {e}")
@@ -682,6 +733,9 @@ Return ONLY this JSON, no markdown, no explanation:
                 data = r.json()
                 text = data["content"][0]["text"].strip()
                 text = text.replace("```json","").replace("```","").strip()
+                match = re.search(r'\{.*\}', text, re.DOTALL)
+                if match:
+                    text = match.group(0)
                 return json.loads(text)
         except Exception as e:
             logger.error(f"Claude fallback failed: {e}")
@@ -749,91 +803,92 @@ def is_topic_used(topic: str) -> bool:
         return False
 
 # ── EVERGREEN FALLBACK TOPICS ──
-# Used when a category has no trending topics from Google Trends
+# Specific, high-search-volume topics Nigerians look for daily
+# These are used when a category has nothing trending in Google RSS
 EVERGREEN_TOPICS = {
     "finance": [
-        "Dollar to Naira black market rate today",
-        "USDT to Naira rate today Binance P2P",
+        "Dollar to Naira exchange rate today black market",
+        "USDT to Naira rate today Binance P2P 2026",
+        "Bitcoin price in Naira today June 2026",
         "How to make money online in Nigeria 2026",
-        "Bitcoin price in Naira today",
         "Best investment apps in Nigeria 2026",
-        "How to save money in Nigeria",
-        "CBN dollar rate today official",
-        "How to send money abroad from Nigeria",
-        "Best fintech apps Nigeria 2026",
-        "Ethereum price naira today",
+        "CBN official dollar rate today 2026",
+        "How to send money abroad from Nigeria cheaply",
+        "Best fintech apps Nigeria 2026 Opay Palmpay",
+        "Ethereum price naira today 2026",
+        "How to convert USDT to Naira in Nigeria",
     ],
     "education": [
-        "JAMB portal mop-up registration 2026",
-        "WAEC 2026 timetable and exam dates",
-        "How to check JAMB result 2026",
-        "Post UTME screening dates 2026",
-        "Scholarship opportunities for Nigerians 2026",
-        "NYSC 2026 mobilization update",
-        "How to apply for federal university admission",
-        "NECO 2026 examination timetable",
-        "Best universities in Nigeria 2026 ranking",
-        "Jobs for Nigerian graduates 2026",
+        "JAMB portal mop-up registration 2026 how to apply",
+        "WAEC 2026 timetable subjects and exam dates",
+        "How to check JAMB UTME result 2026 portal",
+        "Post UTME screening dates and requirements 2026",
+        "Scholarship opportunities for Nigerian students 2026",
+        "NYSC 2026 batch mobilization update",
+        "How to gain university admission in Nigeria 2026",
+        "NECO 2026 examination timetable release",
+        "Best universities in Nigeria 2026 NUC ranking",
+        "Remote jobs for Nigerian graduates 2026",
     ],
     "health": [
-        "Malaria symptoms and treatment Nigeria",
-        "How to treat typhoid fever in Nigeria",
-        "Best medication for stomach ulcer Nigeria",
-        "High blood pressure remedies for Nigerians",
-        "How to know if you have diabetes Nigeria",
-        "Best hospitals in Lagos Nigeria",
+        "Malaria symptoms causes and treatment in Nigeria",
+        "Typhoid fever symptoms treatment and drugs Nigeria",
+        "Best medication for stomach ulcer in Nigeria prices",
+        "High blood pressure causes symptoms treatment Nigeria",
+        "Signs and symptoms of diabetes in Nigerians",
+        "Best hospitals in Lagos Nigeria and their contacts",
         "How to boost immune system naturally Nigeria",
-        "Causes of frequent headache and treatment",
-        "How to lose weight fast Nigeria",
-        "Symptoms of kidney disease in Nigeria",
+        "Causes of frequent headache and dizziness treatment",
+        "How to lose belly fat fast Nigeria diet tips",
+        "Symptoms of kidney disease and treatment Nigeria",
     ],
     "entertainment": [
-        "Best Nollywood movies to watch 2026",
-        "Davido latest news and music 2026",
-        "Burna Boy latest album and tour 2026",
-        "Top Nigerian musicians 2026",
-        "BBNaija 2026 latest update",
-        "Wizkid new song 2026",
-        "Best Nigerian movies on Netflix 2026",
-        "Asake latest music and concert",
-        "Rema latest news and music",
-        "Top Afrobeats songs 2026",
+        "Davido latest news music and shows 2026",
+        "Burna Boy latest album tour and news 2026",
+        "Best Nollywood movies to watch on Netflix 2026",
+        "Wizkid new song album and tour news 2026",
+        "BBNaija Season 9 housemates and updates 2026",
+        "Top Nigerian Afrobeats songs June 2026",
+        "Asake latest music video and concert 2026",
+        "Rema latest song news and tour 2026",
+        "Nigerian movies winning international awards 2026",
+        "Adekunle Gold latest music and news 2026",
     ],
     "tech": [
-        "Best smartphones under 200000 naira 2026",
-        "iPhone 16 price in Nigeria",
-        "Tecno Camon 40 price and specs Nigeria",
-        "Best data plan in Nigeria 2026 MTN Airtel Glo",
-        "Samsung Galaxy A55 price Nigeria",
-        "How to make money with your phone Nigeria",
-        "Best laptops under 500000 naira 2026",
-        "How to start a tech business in Nigeria",
-        "Infinix Note 40 price and review Nigeria",
-        "Best VPN for Nigeria 2026",
+        "Best Android smartphones under 200000 naira 2026",
+        "iPhone 16 official price in Nigeria 2026",
+        "Tecno Camon 40 full specs and price Nigeria",
+        "Best MTN Airtel Glo data plan Nigeria June 2026",
+        "Samsung Galaxy S24 price Nigeria 2026",
+        "How to make money with your smartphone Nigeria",
+        "Best laptops under 400000 naira Nigeria 2026",
+        "Infinix Hot 50 price specs and review Nigeria",
+        "Best free VPN for Nigeria that actually works 2026",
+        "How to start an online business in Nigeria 2026",
     ],
     "news": [
-        "Nigeria fuel price update today 2026",
-        "Tinubu government latest policy Nigeria",
-        "Nigeria economy news today",
-        "Cost of living in Nigeria 2026",
-        "Nigeria electricity tariff update 2026",
-        "Lagos traffic and infrastructure news",
-        "Nigeria security news today",
-        "Nigerian government palliative update",
-        "Nigeria immigration and visa news 2026",
-        "EFCC latest arrest and news Nigeria",
+        "Nigeria fuel petrol price per liter today 2026",
+        "Tinubu government economic policy latest news",
+        "Nigeria inflation rate and cost of living 2026",
+        "NERC electricity tariff increase Nigeria 2026",
+        "Nigeria insecurity news bandits attack latest",
+        "EFCC latest arrest corruption news Nigeria",
+        "Nigeria minimum wage implementation update 2026",
+        "Lagos state government infrastructure project 2026",
+        "Nigeria immigration new passport policy 2026",
+        "CBN new banking policy Nigerians must know",
     ],
     "football": [
-        "Super Eagles 2026 World Cup squad",
-        "Victor Osimhen latest news and goals",
-        "Premier League results this week",
-        "Champions League latest results",
-        "Nigeria vs latest match report",
-        "Ademola Lookman latest news",
-        "AFCON 2025 Nigeria latest update",
-        "Premier League top scorer 2026",
-        "Real Madrid vs Barcelona latest",
-        "Nigerian players abroad latest news",
+        "Super Eagles 2026 FIFA World Cup squad players",
+        "Victor Osimhen latest goals news and transfer",
+        "Premier League top scorer golden boot race 2026",
+        "Champions League final result and highlights",
+        "Nigeria World Cup 2026 fixtures and schedule",
+        "Ademola Lookman Atalanta latest goals news",
+        "AFCON 2025 Nigeria qualification latest update",
+        "Premier League results and table standings 2026",
+        "Real Madrid vs Barcelona El Clasico latest",
+        "Nigerian players in Europe latest performance news",
     ],
 }
 
@@ -916,8 +971,9 @@ async def run_pipeline(force_category: str = None):
         for trend in selected:
             topic = trend["topic"]
             category = trend["category"]
+            is_evergreen = trend.get("source") == "evergreen"
             try:
-                logger.info(f"Processing [{category}]: {topic}")
+                logger.info(f"Processing [{category}]{'[evergreen]' if is_evergreen else '[trending]'}: {topic}")
                 real_data = ""
 
                 if category == "football":
@@ -925,13 +981,22 @@ async def run_pipeline(force_category: str = None):
                     news_data = await fetch_news_context(topic, category)
                     real_data = "\n\n".join(filter(None, [football_data, news_data]))
                 elif category == "finance":
+                    # Always fetch live rates for finance
                     finance_data = await fetch_finance_data(topic)
                     news_data = await fetch_news_context(topic, category)
                     real_data = "\n\n".join(filter(None, [finance_data, news_data]))
                 else:
                     real_data = await fetch_news_context(topic, category)
 
-                article_data = await generate_article(topic, category, real_data)
+                article_data = await generate_article(topic, category, real_data, is_evergreen)
+
+                # Quality check before saving
+                ok, reason = is_article_quality_ok(article_data)
+                if not ok:
+                    logger.warning(f"Article quality failed for '{topic}': {reason}")
+                    await send_to_all_admins(f"⚠️ Article for <b>{topic}</b> failed quality check: {reason}\nSkipping — try again later.")
+                    continue
+
                 image_url = await fetch_image(article_data.get("image_query", topic), category)
 
                 slug = slugify(article_data["title"])
