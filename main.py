@@ -187,6 +187,26 @@ def init_db():
                 'UnrugX Exchange · USDT, BTC, ETH · Instant bank transfer · No hidden fees',
                 'https://unrugx.com', 'Start Now →')
         ON CONFLICT (slot_key) DO NOTHING;
+        CREATE TABLE IF NOT EXISTS article_views (
+            id SERIAL PRIMARY KEY,
+            article_id INTEGER NOT NULL,
+            viewed_at TIMESTAMP DEFAULT NOW()
+        );
+        CREATE INDEX IF NOT EXISTS idx_views_article ON article_views(article_id);
+        CREATE INDEX IF NOT EXISTS idx_views_time ON article_views(viewed_at DESC);
+        CREATE TABLE IF NOT EXISTS sponsored_sessions (
+            id SERIAL PRIMARY KEY,
+            chat_id BIGINT NOT NULL,
+            step VARCHAR(50) DEFAULT 'title',
+            title TEXT,
+            category VARCHAR(50),
+            body TEXT,
+            link TEXT,
+            image_url TEXT,
+            excerpt TEXT,
+            expires_days INTEGER,
+            created_at TIMESTAMP DEFAULT NOW()
+        );
         CREATE INDEX IF NOT EXISTS idx_articles_status ON articles(status);
         CREATE INDEX IF NOT EXISTS idx_articles_category ON articles(category);
         CREATE INDEX IF NOT EXISTS idx_articles_created ON articles(created_at DESC);
@@ -240,9 +260,31 @@ def classify_topic(topic: str) -> Optional[str]:
     """
     t = topic.lower().strip()
 
-    # Rule 1: "X vs Y" or "X v Y" pattern = always football
+    # Rule 1: "X vs Y" or "X v Y" pattern
+    # Only classify as football if at least one entity is a known football team/country/league
     if re.search(r'\bvs?\b', t) or ' v ' in t:
-        return "football"
+        has_football_entity = False
+        for team in KNOWN_TEAMS:
+            if team in t:
+                has_football_entity = True
+                break
+        if not has_football_entity:
+            for country in FOOTBALL_COUNTRIES:
+                if country in t:
+                    has_football_entity = True
+                    break
+        if not has_football_entity:
+            football_league_words = ["epl","ucl","champions league","la liga","serie a",
+                                     "bundesliga","premier league","afcon","fifa","ligue 1",
+                                     "world cup","nations league","euro","copa"]
+            for lw in football_league_words:
+                if lw in t:
+                    has_football_entity = True
+                    break
+        if has_football_entity:
+            return "football"
+        else:
+            return None  # Not a football match — skip (e.g. Knicks vs Spurs, Tyson vs Paul)
 
     # Rule 2: Check for known footballer names
     for name in KNOWN_FOOTBALLERS:
@@ -255,28 +297,25 @@ def classify_topic(topic: str) -> Optional[str]:
             return "football"
 
     # Rule 4: Single football country name trending = football
-    # e.g. "netherlands" alone = football (World Cup context)
     words = t.split()
     if len(words) <= 2:
         for country in FOOTBALL_COUNTRIES:
             if country in t:
                 return "football"
 
-    # Rule 4: Score each category by keyword matches
+    # Rule 5: Score each category by keyword matches
     scores = {}
     for cat, keywords in CAT_KEYWORD_MAP.items():
         score = 0
         for kw in keywords:
             if kw in t:
-                # Longer keyword matches = more confident
                 score += len(kw.split())
         if score > 0:
             scores[cat] = score
 
     if not scores:
-        return None  # Not confident — skip this topic
+        return None
 
-    # Rule 5: Require minimum confidence score of 1
     best_cat = max(scores, key=scores.get)
     if scores[best_cat] < 1:
         return None
@@ -284,7 +323,6 @@ def classify_topic(topic: str) -> Optional[str]:
     # Rule 6: If two categories tie, prefer more specific one
     sorted_scores = sorted(scores.items(), key=lambda x: x[1], reverse=True)
     if len(sorted_scores) > 1 and sorted_scores[0][1] == sorted_scores[1][1]:
-        # Tie — pick whichever is not "news" (more specific)
         for cat, score in sorted_scores:
             if cat != "news":
                 return cat
@@ -364,9 +402,24 @@ def build_search_query(topic: str, category: str) -> str:
         else:
             return f"{topic} football news {year}"
     elif category == "finance":
-        return f"{topic} Nigeria rate naira {year}"
+        # Include Nigerian-specific fintech context for remittance/transfer topics
+        if any(w in t for w in ["send money","transfer","remit","abroad","overseas"]):
+            return f"{topic} LemFi Wise Remitly Nigeria {year}"
+        elif any(w in t for w in ["bitcoin","btc","crypto","usdt","ethereum"]):
+            return f"{topic} Nigeria naira price {year}"
+        elif any(w in t for w in ["dollar","naira","rate","exchange","cbn"]):
+            return f"{topic} black market official rate Nigeria {year}"
+        else:
+            return f"{topic} Nigeria {year}"
     elif category == "education":
         return f"{topic} Nigeria {year}"
+    elif category == "health":
+        return f"{topic} Nigeria treatment medication {year}"
+    elif category == "entertainment":
+        # For entertainment, search for latest news only — avoid training knowledge
+        return f"{topic} latest news {year}"
+    elif category == "news":
+        return f"{topic} Nigeria latest {year}"
     else:
         return f"{topic} Nigeria {year}"
 
@@ -873,14 +926,19 @@ Topic: {topic}
 Category: {cat_context}
 Context: {source_note}{data_section}{extra_instructions}
 
-STRICT RULES:
-1. NEVER fabricate statistics, scores, prices, or quotes not in the real data
-2. NEVER write phrases like "as of my knowledge cutoff" or "I cannot confirm" — if unsure, write general guidance
-3. Write in clear simple English Nigerians understand — no grammar competition
-4. Minimum 400 words, 2-3 subheadings using <h2> tags
-5. Nigerian context throughout — mention naira prices, local brands, Nigerian cities where relevant
-6. For guides/evergreen: be practical, specific, actionable
-7. For news/match reports: be factual, based only on provided real data
+STRICT RULES — FOLLOW EXACTLY:
+1. ONLY use facts, figures, names, and statistics that appear in the VERIFIED REAL DATA provided above
+2. If a fact is NOT in the real data, DO NOT write it — leave it out completely
+3. NEVER add song titles, album names, award nominations, film titles, or player names from your own training knowledge unless they appear in the real data
+4. NEVER present government promises or pledges as confirmed facts — always say "the government says" or "according to officials"
+5. For government/economic articles: always include both positive indicators AND challenges/criticism — never one-sided reporting
+5. For government/economic articles: always include BOTH positive indicators AND challenges/criticism — never one-sided
+6. For health articles: always add disclaimer "Consult a doctor before taking any medication"
+7. For finance articles: never state a specific exchange rate unless it appears in the real data
+8. Write in clear simple English Nigerians understand — no grammar competition
+9. Minimum 400 words, 2-3 subheadings using <h2> tags
+10. Nigerian context throughout — naira prices, local brands, Nigerian cities where relevant
+11. NEVER write phrases like "as of my knowledge" or "I cannot confirm" — if you don't have data, write general guidance instead
 
 Return ONLY this JSON — no markdown, no explanation, no preamble:
 {{
@@ -991,7 +1049,56 @@ def is_topic_used(topic: str) -> bool:
     except:
         return False
 
-# ── EVERGREEN FALLBACK TOPICS ──
+# ── SPONSORED ARTICLE SESSION HELPERS ──
+def get_sponsored_session(chat_id: int) -> Optional[dict]:
+    try:
+        conn = get_db()
+        cur = conn.cursor()
+        cur.execute("SELECT * FROM sponsored_sessions WHERE chat_id=%s ORDER BY created_at DESC LIMIT 1", (chat_id,))
+        row = cur.fetchone()
+        cur.close()
+        conn.close()
+        return dict(row) if row else None
+    except:
+        return None
+
+def update_sponsored_session(chat_id: int, **kwargs):
+    try:
+        conn = get_db()
+        cur = conn.cursor()
+        existing = get_sponsored_session(chat_id)
+        if not existing:
+            cur.execute("INSERT INTO sponsored_sessions (chat_id) VALUES (%s)", (chat_id,))
+            conn.commit()
+        sets = ", ".join([f"{k}=%s" for k in kwargs.keys()])
+        cur.execute(f"UPDATE sponsored_sessions SET {sets} WHERE chat_id=%s",
+                    list(kwargs.values()) + [chat_id])
+        conn.commit()
+        cur.close()
+        conn.close()
+    except Exception as e:
+        logger.error(f"Session update error: {e}")
+
+def clear_sponsored_session(chat_id: int):
+    try:
+        conn = get_db()
+        cur = conn.cursor()
+        cur.execute("DELETE FROM sponsored_sessions WHERE chat_id=%s", (chat_id,))
+        conn.commit()
+        cur.close()
+        conn.close()
+    except Exception as e:
+        logger.error(f"Session clear error: {e}")
+
+CATEGORIES_DISPLAY = {
+    "entertainment": "🎭 Entertainment",
+    "finance": "💰 Finance",
+    "tech": "📱 Tech",
+    "health": "🏥 Health",
+    "education": "📚 Education",
+    "news": "📰 News",
+    "football": "⚽ Football"
+}
 # Specific, high-search-volume topics Nigerians look for daily
 # These are used when a category has nothing trending in Google RSS
 EVERGREEN_TOPICS = {
@@ -1274,7 +1381,9 @@ async def get_article(slug: str):
         cur.close()
         conn.close()
         raise HTTPException(status_code=404, detail="Article not found")
+    # Increment views counter and log to article_views for stats tracking
     cur.execute("UPDATE articles SET views=views+1 WHERE slug=%s", (slug,))
+    cur.execute("INSERT INTO article_views (article_id) VALUES (%s)", (article["id"],))
     conn.commit()
     cur.close()
     conn.close()
@@ -1298,19 +1407,50 @@ async def get_trending():
 async def get_stats():
     conn = get_db()
     cur = conn.cursor()
+    # Total published
     cur.execute("SELECT COUNT(*) as t FROM articles WHERE status='published'")
     total = cur.fetchone()["t"]
     cur.execute("SELECT COUNT(*) as p FROM articles WHERE status='pending'")
     pending = cur.fetchone()["p"]
-    cur.execute("SELECT COALESCE(SUM(views),0) as v FROM articles")
-    views = cur.fetchone()["v"]
+    # Daily stats
+    cur.execute("SELECT COUNT(*) as c FROM article_views WHERE viewed_at >= NOW() - INTERVAL '1 day'")
+    views_today = cur.fetchone()["c"]
+    cur.execute("SELECT COUNT(*) as c FROM articles WHERE status='published' AND published_at >= NOW() - INTERVAL '1 day'")
+    published_today = cur.fetchone()["c"]
+    # Weekly stats
+    cur.execute("SELECT COUNT(*) as c FROM article_views WHERE viewed_at >= NOW() - INTERVAL '7 days'")
+    views_week = cur.fetchone()["c"]
+    cur.execute("SELECT COUNT(*) as c FROM articles WHERE status='published' AND published_at >= NOW() - INTERVAL '7 days'")
+    published_week = cur.fetchone()["c"]
+    # Monthly stats
+    cur.execute("SELECT COUNT(*) as c FROM article_views WHERE viewed_at >= NOW() - INTERVAL '30 days'")
+    views_month = cur.fetchone()["c"]
+    cur.execute("SELECT COUNT(*) as c FROM articles WHERE status='published' AND published_at >= NOW() - INTERVAL '30 days'")
+    published_month = cur.fetchone()["c"]
+    # By category
     cur.execute("SELECT category, COUNT(*) as count FROM articles WHERE status='published' GROUP BY category ORDER BY count DESC")
     by_cat = cur.fetchall()
-    cur.execute("SELECT id, title, category, views, created_at FROM articles WHERE status='published' ORDER BY created_at DESC LIMIT 5")
-    recent = cur.fetchall()
+    # Top articles this month
+    cur.execute("""
+        SELECT a.id, a.title, a.category, COUNT(v.id) as month_views
+        FROM articles a LEFT JOIN article_views v ON a.id=v.article_id
+        AND v.viewed_at >= NOW() - INTERVAL '30 days'
+        WHERE a.status='published'
+        GROUP BY a.id, a.title, a.category
+        ORDER BY month_views DESC LIMIT 5
+    """)
+    top_articles = cur.fetchall()
     cur.close()
     conn.close()
-    return {"total_published": total, "pending_approval": pending, "total_views": views, "by_category": [dict(r) for r in by_cat], "recent": [dict(r) for r in recent]}
+    return {
+        "total_published": total,
+        "pending_approval": pending,
+        "daily": {"views": views_today, "published": published_today},
+        "weekly": {"views": views_week, "published": published_week},
+        "monthly": {"views": views_month, "published": published_month},
+        "by_category": [dict(r) for r in by_cat],
+        "top_articles_this_month": [dict(r) for r in top_articles]
+    }
 
 @app.post("/api/pipeline/run")
 async def trigger_pipeline(background_tasks: BackgroundTasks):
@@ -1408,6 +1548,78 @@ async def telegram_webhook(request: Request):
                 cur.close()
                 conn.close()
                 await send_to_all_admins(f"❌ Article #{article_id} rejected.")
+
+            elif cb_data.startswith("pub_sponsored_"):
+                session_chat_id = int(cb_data.split("_")[2])
+                s = get_sponsored_session(session_chat_id)
+                if not s:
+                    await send_telegram(cb["from"]["id"], "❌ Session expired. Start again with /sponsored.")
+                else:
+                    try:
+                        category = s.get("category", "news")
+                        title = s.get("title", "Sponsored Article")
+                        body_text = s.get("body", "")
+                        link = s.get("link", "")
+                        image_url = s.get("image_url", "")
+                        expires_days = s.get("expires_days")
+
+                        # Add sponsored badge and link to body
+                        full_body = f'<p><strong>⚠️ Sponsored Content</strong></p>{body_text}'
+                        if link:
+                            full_body += f'<p><a href="{link}" target="_blank">👉 Learn More / Visit Website</a></p>'
+
+                        # Use category fallback image if no image provided
+                        fallbacks = {
+                            "entertainment": "https://images.unsplash.com/photo-1493225457124-a3eb161ffa5f?w=900&q=80",
+                            "finance": "https://images.unsplash.com/photo-1611974789855-9c2a0a7236a3?w=900&q=80",
+                            "tech": "https://images.unsplash.com/photo-1574944985070-8f3ebc6b79d2?w=900&q=80",
+                            "health": "https://images.unsplash.com/photo-1559757148-5c350d0d3c56?w=900&q=80",
+                            "education": "https://images.unsplash.com/photo-1523050854058-8df90110c9f1?w=900&q=80",
+                            "news": "https://images.unsplash.com/photo-1508921912186-1d1a45ebb3c1?w=900&q=80",
+                            "football": "https://images.unsplash.com/photo-1574629810360-7efbbe195018?w=900&q=80",
+                        }
+                        if not image_url:
+                            image_url = fallbacks.get(category, fallbacks["news"])
+
+                        slug = slugify(title)
+                        excerpt = f"[SPONSORED] {body_text[:150]}..."
+                        published_at = "NOW()"
+                        expires_at = f"NOW() + INTERVAL '{expires_days} days'" if expires_days else "NULL"
+
+                        conn = get_db()
+                        cur = conn.cursor()
+                        # Add expires_at column if not exists
+                        try:
+                            cur.execute("ALTER TABLE articles ADD COLUMN IF NOT EXISTS expires_at TIMESTAMP")
+                            conn.commit()
+                        except:
+                            conn.rollback()
+
+                        cur.execute(f"""
+                            INSERT INTO articles (slug, title, category, excerpt, body, image_url, status, published_at, expires_at)
+                            VALUES (%s, %s, %s, %s, %s, %s, 'published', NOW(), {expires_at})
+                            RETURNING id
+                        """, (slug, title, category, excerpt, full_body, image_url))
+                        article_id = cur.fetchone()["id"]
+                        conn.commit()
+                        cur.close()
+                        conn.close()
+
+                        clear_sponsored_session(session_chat_id)
+                        await send_to_all_admins(
+                            f"✅ <b>Sponsored Article Published</b>\n\n"
+                            f"ID: #{article_id}\n"
+                            f"Title: {title}\n"
+                            f"Category: {category.upper()}\n"
+                            f"Expiry: {'In ' + str(expires_days) + ' days' if expires_days else 'No expiry'}"
+                        )
+                    except Exception as e:
+                        await send_telegram(cb["from"]["id"], f"❌ Error publishing: {e}")
+
+            elif cb_data.startswith("cancel_sponsored_"):
+                session_chat_id = int(cb_data.split("_")[2])
+                clear_sponsored_session(session_chat_id)
+                await send_telegram(cb["from"]["id"], "✅ Sponsored article cancelled.")
             async with httpx.AsyncClient() as client:
                 await client.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/answerCallbackQuery", json={"callback_query_id": cb["id"]})
 
@@ -1423,7 +1635,7 @@ async def telegram_webhook(request: Request):
             elif text == "/help":
                 cmd = (
                     "🤖 <b>NaijaFlash Bot Commands</b>\n\n"
-                    "/stats — Blog statistics\n"
+                    "/stats — Blog statistics (daily/weekly/monthly)\n"
                     "/trends — See what's trending in Nigeria now\n"
                     "/generate — Generate articles from all trends\n"
                     "/generate [category] — Generate from specific category\n\n"
@@ -1432,6 +1644,10 @@ async def telegram_webhook(request: Request):
                     "/tech 📱 /health 🏥 /education 📚 /news 📰\n\n"
                     "/pending — View pending articles\n"
                     "/delete [id] — Delete an article by ID\n\n"
+                    "<b>Sponsored Articles:</b>\n"
+                    "/sponsored — Create a sponsored article\n"
+                    "/listsponsored — View all sponsored articles\n"
+                    "/deletesponsored [id] — Remove a sponsored article\n\n"
                     "<b>Ad Management:</b>\n"
                     "/viewad — See current ad slot\n"
                     "/setad Headline | Subtext | Link | Button — Update ad\n"
@@ -1461,18 +1677,55 @@ async def telegram_webhook(request: Request):
                 conn = get_db()
                 cur = conn.cursor()
                 cur.execute("SELECT COUNT(*) as t FROM articles WHERE status='published'")
-                pub = cur.fetchone()["t"]
+                total = cur.fetchone()["t"]
                 cur.execute("SELECT COUNT(*) as p FROM articles WHERE status='pending'")
                 pend = cur.fetchone()["p"]
-                cur.execute("SELECT COALESCE(SUM(views),0) as v FROM articles")
-                views = cur.fetchone()["v"]
+                # Daily
+                cur.execute("SELECT COUNT(*) as c FROM article_views WHERE viewed_at >= NOW() - INTERVAL '1 day'")
+                views_today = cur.fetchone()["c"]
+                cur.execute("SELECT COUNT(*) as c FROM articles WHERE status='published' AND published_at >= NOW() - INTERVAL '1 day'")
+                pub_today = cur.fetchone()["c"]
+                # Weekly
+                cur.execute("SELECT COUNT(*) as c FROM article_views WHERE viewed_at >= NOW() - INTERVAL '7 days'")
+                views_week = cur.fetchone()["c"]
+                cur.execute("SELECT COUNT(*) as c FROM articles WHERE status='published' AND published_at >= NOW() - INTERVAL '7 days'")
+                pub_week = cur.fetchone()["c"]
+                # Monthly
+                cur.execute("SELECT COUNT(*) as c FROM article_views WHERE viewed_at >= NOW() - INTERVAL '30 days'")
+                views_month = cur.fetchone()["c"]
+                cur.execute("SELECT COUNT(*) as c FROM articles WHERE status='published' AND published_at >= NOW() - INTERVAL '30 days'")
+                pub_month = cur.fetchone()["c"]
+                # By category
                 cur.execute("SELECT category, COUNT(*) as c FROM articles WHERE status='published' GROUP BY category ORDER BY c DESC")
                 cats = cur.fetchall()
+                # Top article this month
+                cur.execute("""
+                    SELECT a.title, COUNT(v.id) as mv FROM articles a
+                    LEFT JOIN article_views v ON a.id=v.article_id
+                    AND v.viewed_at >= NOW() - INTERVAL '30 days'
+                    WHERE a.status='published'
+                    GROUP BY a.id, a.title ORDER BY mv DESC LIMIT 1
+                """)
+                top = cur.fetchone()
                 cur.close()
                 conn.close()
                 cat_lines = "\n".join([f"  • {r['category']}: {r['c']}" for r in cats]) or "  None yet"
+                top_line = f"\n\n🏆 <b>Top Article This Month:</b>\n{top['title'][:60]}... ({top['mv']} views)" if top and top['mv'] > 0 else ""
                 await send_telegram(chat_id,
-                    f"📊 <b>NaijaFlash Stats</b>\n\n✅ Published: {pub}\n⏳ Pending: {pend}\n👁 Total Views: {views}\n\n<b>By Category:</b>\n{cat_lines}"
+                    f"📊 <b>NaijaFlash Stats</b>\n\n"
+                    f"📰 Total Published: {total}\n"
+                    f"⏳ Pending Approval: {pend}\n\n"
+                    f"<b>Today</b>\n"
+                    f"  👁 Views: {views_today}\n"
+                    f"  📝 Published: {pub_today}\n\n"
+                    f"<b>This Week</b>\n"
+                    f"  👁 Views: {views_week}\n"
+                    f"  📝 Published: {pub_week}\n\n"
+                    f"<b>This Month</b>\n"
+                    f"  👁 Views: {views_month}\n"
+                    f"  📝 Published: {pub_month}\n\n"
+                    f"<b>By Category:</b>\n{cat_lines}"
+                    f"{top_line}"
                 )
 
             elif text == "/generate" or text.startswith("/generate "):
@@ -1707,6 +1960,165 @@ async def telegram_webhook(request: Request):
                         )
                 except Exception as e:
                     await send_telegram(chat_id, f"❌ Error: {e}")
+
+            elif text == "/sponsored":
+                if not is_admin(user_id):
+                    await send_telegram(chat_id, "⛔ Admins only.")
+                    return {"ok": True}
+                clear_sponsored_session(chat_id)
+                update_sponsored_session(chat_id, step="title")
+                await send_telegram(chat_id,
+                    "📢 <b>Create Sponsored Article</b>\n\n"
+                    "Step 1/6 — Send the <b>article title</b>:\n\n"
+                    "Example: <i>Jumia Black Friday — Up To 70% Off Phones</i>\n\n"
+                    "Send /cancel to stop."
+                )
+
+            elif text == "/listsponsored":
+                if not is_admin(user_id):
+                    await send_telegram(chat_id, "⛔ Admins only.")
+                    return {"ok": True}
+                conn = get_db()
+                cur = conn.cursor()
+                cur.execute("""
+                    SELECT id, title, category, published_at
+                    FROM articles WHERE status='published' AND excerpt LIKE '%[SPONSORED]%'
+                    ORDER BY published_at DESC LIMIT 10
+                """)
+                rows = cur.fetchall()
+                cur.close()
+                conn.close()
+                if not rows:
+                    await send_telegram(chat_id, "No sponsored articles published yet.")
+                else:
+                    lines = "\n".join([f"#{r['id']} [{r['category'].upper()}] {r['title'][:45]}..." for r in rows])
+                    await send_telegram(chat_id, f"📢 <b>Sponsored Articles</b>\n\n{lines}\n\nUse /deletesponsored [id] to remove.")
+
+            elif text.startswith("/deletesponsored"):
+                if not is_admin(user_id):
+                    await send_telegram(chat_id, "⛔ Admins only.")
+                    return {"ok": True}
+                parts = text.split()
+                if len(parts) < 2:
+                    await send_telegram(chat_id, "Usage: /deletesponsored [article_id]")
+                    return {"ok": True}
+                try:
+                    article_id = int(parts[1])
+                    conn = get_db()
+                    cur = conn.cursor()
+                    cur.execute("SELECT title FROM articles WHERE id=%s", (article_id,))
+                    row = cur.fetchone()
+                    if not row:
+                        await send_telegram(chat_id, f"❌ Article #{article_id} not found.")
+                        cur.close()
+                        conn.close()
+                        return {"ok": True}
+                    cur.execute("DELETE FROM articles WHERE id=%s", (article_id,))
+                    conn.commit()
+                    cur.close()
+                    conn.close()
+                    await send_to_all_admins(f"🗑️ Sponsored article #{article_id} deleted: {row['title'][:50]}")
+                except ValueError:
+                    await send_telegram(chat_id, "❌ Invalid ID. Usage: /deletesponsored [number]")
+                except Exception as e:
+                    await send_telegram(chat_id, f"❌ Error: {e}")
+
+            elif text == "/cancel":
+                session = get_sponsored_session(chat_id)
+                if session:
+                    clear_sponsored_session(chat_id)
+                    await send_telegram(chat_id, "✅ Cancelled.")
+                else:
+                    await send_telegram(chat_id, "Nothing to cancel.")
+
+            # ── SPONSORED MULTI-STEP FLOW ──
+            else:
+                session = get_sponsored_session(chat_id)
+                if session and is_admin(user_id):
+                    step = session.get("step")
+
+                    if step == "title":
+                        update_sponsored_session(chat_id, title=text, step="category")
+                        cat_lines = "\n".join([f"{i+1}. {v}" for i,(k,v) in enumerate(CATEGORIES_DISPLAY.items())])
+                        await send_telegram(chat_id,
+                            f"✅ Title saved.\n\n"
+                            f"Step 2/6 — Choose a <b>category</b>:\n\n{cat_lines}\n\nReply with the number (1-7)."
+                        )
+
+                    elif step == "category":
+                        cat_keys = list(CATEGORIES_DISPLAY.keys())
+                        try:
+                            idx = int(text.strip()) - 1
+                            if 0 <= idx < len(cat_keys):
+                                chosen_cat = cat_keys[idx]
+                                update_sponsored_session(chat_id, category=chosen_cat, step="body")
+                                await send_telegram(chat_id,
+                                    f"✅ Category: <b>{CATEGORIES_DISPLAY[chosen_cat]}</b>\n\n"
+                                    f"Step 3/6 — Send the <b>article body</b> (full content):\n\nMinimum 100 words recommended."
+                                )
+                            else:
+                                await send_telegram(chat_id, "❌ Invalid. Reply with 1-7.")
+                        except ValueError:
+                            await send_telegram(chat_id, "❌ Reply with a number 1-7.")
+
+                    elif step == "body":
+                        update_sponsored_session(chat_id, body=text, step="link")
+                        await send_telegram(chat_id,
+                            f"✅ Body saved.\n\n"
+                            f"Step 4/6 — Send the <b>brand link</b> (URL):\n\n"
+                            f"Example: https://jumia.com.ng\n\nSend /skip to leave blank."
+                        )
+
+                    elif step == "link":
+                        link = "" if text == "/skip" else text.strip()
+                        update_sponsored_session(chat_id, link=link, step="image")
+                        await send_telegram(chat_id,
+                            f"✅ Link saved.\n\n"
+                            f"Step 5/6 — Send the <b>image URL</b>:\n\n"
+                            f"📱 <b>Have your own image? Upload it free at:</b>\n"
+                            f"• <b>imgbb.com</b> — best option, no account needed, instant link\n"
+                            f"• postimages.org — simple and free\n"
+                            f"• imgur.com — popular and reliable\n\n"
+                            f"Upload image → copy <b>Direct link</b> → paste here.\n\n"
+                            f"Or send /skip to use a default category image."
+                        )
+
+                    elif step == "image":
+                        image_url = "" if text == "/skip" else text.strip()
+                        update_sponsored_session(chat_id, image_url=image_url, step="expiry")
+                        await send_telegram(chat_id,
+                            f"✅ Image saved.\n\n"
+                            f"Step 6/6 — How many <b>days</b> should this stay live?\n\n"
+                            f"Reply with a number e.g. <b>30</b>\n"
+                            f"Or send /skip for no expiry (stays permanently)."
+                        )
+
+                    elif step == "expiry":
+                        expires_days = None
+                        if text != "/skip":
+                            try:
+                                expires_days = int(text.strip())
+                            except ValueError:
+                                await send_telegram(chat_id, "❌ Reply with a number or /skip.")
+                                return {"ok": True}
+                        update_sponsored_session(chat_id, expires_days=expires_days, step="preview")
+                        s = get_sponsored_session(chat_id)
+                        expiry_text = f"Expires in {expires_days} days" if expires_days else "No expiry"
+                        preview = (
+                            f"👁 <b>PREVIEW</b>\n\n"
+                            f"<b>Title:</b> {s.get('title','')}\n"
+                            f"<b>Category:</b> {CATEGORIES_DISPLAY.get(s.get('category',''),'')}\n"
+                            f"<b>Link:</b> {s.get('link') or 'None'}\n"
+                            f"<b>Image:</b> {'Custom' if s.get('image_url') else 'Default'}\n"
+                            f"<b>Expiry:</b> {expiry_text}\n\n"
+                            f"<b>Body preview:</b>\n{str(s.get('body',''))[:300]}...\n\n"
+                            f"Publish this article?"
+                        )
+                        markup = {"inline_keyboard": [[
+                            {"text": "✅ Publish Now", "callback_data": f"pub_sponsored_{chat_id}"},
+                            {"text": "❌ Cancel", "callback_data": f"cancel_sponsored_{chat_id}"}
+                        ]]}
+                        await send_telegram(chat_id, preview, reply_markup=markup)
 
     except Exception as e:
         logger.error(f"Webhook error: {e}")
