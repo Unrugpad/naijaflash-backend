@@ -330,7 +330,7 @@ def classify_topic(topic: str) -> Optional[str]:
             scores[cat] = score
 
     if not scores:
-        return None
+        return None  # No category matched — skip this topic entirely
 
     best_cat = max(scores, key=scores.get)
     if scores[best_cat] < 1:
@@ -342,6 +342,10 @@ def classify_topic(topic: str) -> Optional[str]:
         for cat, score in sorted_scores:
             if cat != "news":
                 return cat
+
+    # Rule 7: Never return football unless there's a real football keyword match
+    if best_cat == "football" and scores.get("football", 0) < 1:
+        return None
 
     return best_cat
 
@@ -412,6 +416,24 @@ WEBSITE_NAME_PATTERNS = [
     r'.{30,}[;·•].{10,}[;·•]',
     # Strings that start with a news item then add more — likely aggregator
     r'\w+\s+\d+:\d+\s+(mon|tue|wed|thu|fri|sat|sun)',
+    # Markdown headers
+    r'^#{1,6}\s+',
+    # Spotify/music playlists
+    r'playlist by \w+',
+    r'\d+ tracks?',
+    r'spotify|apple music|audiomack',
+    # Data table titles
+    r'rates?\s*\(₦/us\$\)',
+    r'nfem\s+rates?',
+    r'exchange rates?\s+table',
+    # Presidency/government page titles
+    r'^seal of the president',
+    r'^office of the (president|vice president)',
+    # Source + date formats
+    r'leadership,\s+nigeria\s+\d+(d|h|m)\.',
+    r'\|\s+\d+(d|h|m)\s*$',
+    # "Vision for" type titles — too vague
+    r"^[A-Za-z']+['s]+\s+vision for",
 ]
 
 def is_website_name(title: str) -> bool:
@@ -530,10 +552,22 @@ async def fetch_topics_from_tavily(category: str, queries) -> List[dict]:
                     page_title = res.get("title", "").strip()
                     content = res.get("content", "").strip()
                     url = res.get("url", "")
+                    pub_date = res.get("published_date", "") or ""
+
+                    # Skip results older than 14 days
+                    if pub_date:
+                        try:
+                            pub_dt = datetime.fromisoformat(pub_date.replace("Z", "+00:00"))
+                            age_days = (datetime.now(timezone.utc) - pub_dt).days
+                            if age_days > 14:
+                                continue
+                        except Exception:
+                            pass
 
                     skip_domains = ["google.com","bing.com","yahoo.com","reddit.com",
                                     "wikipedia.org","facebook.com","twitter.com","x.com",
-                                    "youtube.com","instagram.com","tiktok.com"]
+                                    "youtube.com","instagram.com","tiktok.com","spotify.com",
+                                    "apple.com","audiomack.com"]
                     if any(d in url for d in skip_domains):
                         continue
 
@@ -546,8 +580,15 @@ async def fetch_topics_from_tavily(category: str, queries) -> List[dict]:
                         continue
                     seen.add(h_lower)
 
+                    # Classify — if result clearly belongs to different category, use that
                     detected_cat = classify_topic(headline)
+                    # Only use detected_cat if it's confident, otherwise use search category
                     final_cat = detected_cat if detected_cat else category
+
+                    # Skip if misclassified as football with no football keywords
+                    if final_cat == "football" and category != "football":
+                        if not any(kw in headline.lower() for kw in ["football","soccer","goal","match","premier","league","afcon","fifa","ucl"]):
+                            final_cat = category
 
                     topics.append({
                         "topic": headline,
@@ -1644,7 +1685,7 @@ async def run_pipeline(force_category: str = None):
     Pipeline with optional category filter.
     Falls back to evergreen topics when nothing is trending for a category.
     """
-    label = f"[{force_category.upper()}]" if force_category else "[ALL]"
+    label = f"[{force_category.upper()}]" if force_category else "[ALL CATEGORIES]"
     logger.info(f"Pipeline {label} started")
     generated = 0
 
@@ -1657,11 +1698,9 @@ async def run_pipeline(force_category: str = None):
             new_cat_trends = [t for t in cat_trends if not is_topic_used(t["topic"])]
 
             if new_cat_trends:
-                # Use trending topics
-                selected = new_cat_trends[:3]
+                selected = new_cat_trends[:2]  # Max 2 per category per run
                 logger.info(f"Using {len(selected)} trending topics for {force_category}")
             else:
-                # Fall back to evergreen
                 fallback = get_fallback_topic(force_category)
                 if not fallback:
                     await send_to_all_admins(f"⚠️ No topics available for <b>{force_category.upper()}</b>.")
@@ -1673,12 +1712,21 @@ async def run_pipeline(force_category: str = None):
                     f"Using evergreen topic: <i>{fallback['topic']}</i>"
                 )
         else:
-            # All categories — use trending + fill gaps with evergreen
+            # All categories — pick max 1 topic per category, diverse coverage
             new_trends = [t for t in trends if not is_topic_used(t["topic"])]
+
             if new_trends:
-                selected = new_trends[:3]
+                # Pick best topic per category (max 1 each, max 5 total)
+                seen_cats = {}
+                selected = []
+                for t in new_trends:
+                    cat = t["category"]
+                    if cat not in seen_cats:
+                        seen_cats[cat] = 0
+                    if seen_cats[cat] < 1 and len(selected) < 5:
+                        selected.append(t)
+                        seen_cats[cat] += 1
             else:
-                # Nothing trending — pick one evergreen from a random category
                 cat = random.choice(CATEGORIES)
                 fallback = get_fallback_topic(cat)
                 if not fallback:
@@ -1688,6 +1736,14 @@ async def run_pipeline(force_category: str = None):
                 await send_to_all_admins(
                     f"ℹ️ No new trending topics right now.\n"
                     f"Using evergreen topic: <i>{fallback['topic']}</i>"
+                )
+
+            # Send ONE combined status message for all categories
+            if selected:
+                cats_found = list({t["category"] for t in selected})
+                cat_labels = " · ".join([c.upper() for c in cats_found])
+                await send_to_all_admins(
+                    f"⚙️ Generating {len(selected)} articles across: {cat_labels}"
                 )
 
         # Process selected topics
@@ -2186,17 +2242,19 @@ async def telegram_webhook(request: Request):
                         f"Valid categories:\n" + "\n".join([f"• {c}" for c in CATEGORIES])
                     )
                     return {"ok": True}
-                label = f"<b>{force_cat.upper()}</b>" if force_cat else "all categories"
-                await send_telegram(chat_id, f"⚙️ Fetching Nigeria trends for {label}...")
+                if force_cat:
+                    await send_telegram(chat_id, f"⚙️ Generating <b>{force_cat.upper()}</b> articles...")
+                else:
+                    await send_telegram(chat_id, "⚙️ Fetching Nigeria trends across all categories...")
                 asyncio.create_task(run_pipeline(force_cat))
 
-            # Category shortcut commands
+            # Category shortcut commands — /football, /finance, etc.
             elif text in [f"/{c}" for c in CATEGORIES]:
                 if not is_admin(user_id):
                     await send_telegram(chat_id, "⛔ Admins only.")
                     return {"ok": True}
-                cat = text[1:]  # strip the /
-                await send_telegram(chat_id, f"⚙️ Fetching trending <b>{cat.upper()}</b> topics...")
+                cat = text[1:]
+                await send_telegram(chat_id, f"⚙️ Generating <b>{cat.upper()}</b> articles...")
                 asyncio.create_task(run_pipeline(cat))
 
             elif text == "/pending":
