@@ -208,6 +208,15 @@ def is_admin(chat_id: int) -> bool:
     return chat_id in get_all_admins()
 
 # ── SMART CLASSIFIER ──
+
+# Known football countries — single word trending = football
+FOOTBALL_COUNTRIES = [
+    "netherlands","france","england","germany","spain","italy","portugal","brazil",
+    "argentina","nigeria","ghana","senegal","cameroon","egypt","morocco","algeria",
+    "croatia","belgium","switzerland","denmark","sweden","norway","scotland","wales",
+    "japan","korea","australia","usa","mexico","colombia","uruguay","chile","ecuador"
+]
+
 def classify_topic(topic: str) -> Optional[str]:
     """
     Classify a trending topic into one of our 7 categories.
@@ -228,6 +237,14 @@ def classify_topic(topic: str) -> Optional[str]:
     for team in KNOWN_TEAMS:
         if team in t:
             return "football"
+
+    # Rule 4: Single football country name trending = football
+    # e.g. "netherlands" alone = football (World Cup context)
+    words = t.split()
+    if len(words) <= 2:
+        for country in FOOTBALL_COUNTRIES:
+            if country in t:
+                return "football"
 
     # Rule 4: Score each category by keyword matches
     scores = {}
@@ -732,25 +749,38 @@ def is_topic_used(topic: str) -> bool:
         return False
 
 # ── MAIN PIPELINE ──
-async def run_pipeline():
-    logger.info("Pipeline v4 started")
+async def run_pipeline(force_category: str = None):
+    """
+    Pipeline with optional category filter.
+    force_category: if set, only process trends from that category.
+    """
+    label = f"[{force_category.upper()}]" if force_category else "[ALL]"
+    logger.info(f"Pipeline {label} started")
     generated = 0
 
     try:
         trends = await fetch_nigeria_trends()
 
         if not trends:
-            await send_to_all_admins(
-                "⚠️ No relevant trends found in Nigeria right now.\n"
-                "Google Trends may be slow or all current trends don't match our categories."
-            )
+            await send_to_all_admins("⚠️ No relevant trends found in Nigeria right now.")
             return
+
+        # Filter by forced category if specified
+        if force_category:
+            trends = [t for t in trends if t["category"] == force_category]
+            if not trends:
+                await send_to_all_admins(
+                    f"ℹ️ No trending topics found for <b>{force_category.upper()}</b> right now.\n"
+                    f"Try /trends to see what's currently trending."
+                )
+                return
 
         new_trends = [t for t in trends if not is_topic_used(t["topic"])]
         logger.info(f"{len(trends)} valid trends, {len(new_trends)} new")
 
         if not new_trends:
-            await send_to_all_admins("ℹ️ All trending topics already covered. Try again later when new trends appear.")
+            cat_msg = f" in <b>{force_category.upper()}</b>" if force_category else ""
+            await send_to_all_admins(f"ℹ️ All trending topics{cat_msg} already covered. Try again later.")
             return
 
         # Process up to 3 per run
@@ -799,7 +829,7 @@ async def run_pipeline():
         if generated == 0:
             await send_to_all_admins("⚠️ Pipeline ran but failed to generate articles. Check Railway logs.")
         else:
-            logger.info(f"Pipeline done. {generated} articles generated.")
+            logger.info(f"Pipeline {label} done. {generated} articles generated.")
 
     except Exception as e:
         logger.error(f"Pipeline error: {e}")
@@ -961,7 +991,11 @@ async def telegram_webhook(request: Request):
                     "🤖 <b>NaijaFlash Bot Commands</b>\n\n"
                     "/stats — Blog statistics\n"
                     "/trends — See what's trending in Nigeria now\n"
-                    "/generate — Generate articles from trends\n"
+                    "/generate — Generate articles from all trends\n"
+                    "/generate [category] — Generate from specific category\n\n"
+                    "<b>Category Shortcuts:</b>\n"
+                    "/football ⚽ /finance 💰 /entertainment 🎭\n"
+                    "/tech 📱 /health 🏥 /education 📚 /news 📰\n\n"
                     "/pending — View pending articles\n"
                     "/help — Show this message"
                 )
@@ -1002,12 +1036,30 @@ async def telegram_webhook(request: Request):
                     f"📊 <b>NaijaFlash Stats</b>\n\n✅ Published: {pub}\n⏳ Pending: {pend}\n👁 Total Views: {views}\n\n<b>By Category:</b>\n{cat_lines}"
                 )
 
-            elif text == "/generate":
+            elif text == "/generate" or text.startswith("/generate "):
                 if not is_admin(user_id):
                     await send_telegram(chat_id, "⛔ Admins only.")
                     return {"ok": True}
-                await send_telegram(chat_id, "⚙️ Fetching Nigeria trends & generating articles...")
-                asyncio.create_task(run_pipeline())
+                parts = text.split()
+                force_cat = parts[1].lower() if len(parts) > 1 else None
+                if force_cat and force_cat not in CATEGORIES:
+                    await send_telegram(chat_id,
+                        f"⛔ Unknown category: <b>{force_cat}</b>\n\n"
+                        f"Valid categories:\n" + "\n".join([f"• {c}" for c in CATEGORIES])
+                    )
+                    return {"ok": True}
+                label = f"<b>{force_cat.upper()}</b>" if force_cat else "all categories"
+                await send_telegram(chat_id, f"⚙️ Fetching Nigeria trends for {label}...")
+                asyncio.create_task(run_pipeline(force_cat))
+
+            # Category shortcut commands
+            elif text in [f"/{c}" for c in CATEGORIES]:
+                if not is_admin(user_id):
+                    await send_telegram(chat_id, "⛔ Admins only.")
+                    return {"ok": True}
+                cat = text[1:]  # strip the /
+                await send_telegram(chat_id, f"⚙️ Fetching trending <b>{cat.upper()}</b> topics...")
+                asyncio.create_task(run_pipeline(cat))
 
             elif text == "/pending":
                 if not is_admin(user_id):
