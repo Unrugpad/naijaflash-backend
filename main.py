@@ -443,25 +443,28 @@ async def fetch_news_context(topic: str, category: str = "news") -> str:
                         "max_results": 5,
                         "include_answer": True,
                         "include_raw_content": False,
+                        "sort_by": "date",  # Most recent first
                     }
                 )
                 if r.status_code == 200:
                     data = r.json()
                     parts = []
 
-                    # Include Tavily's auto-generated answer summary if available
+                    # Include Tavily's auto-generated answer summary
                     answer = data.get("answer", "")
                     if answer:
-                        parts.append(f"Summary: {answer}")
+                        parts.append(f"CURRENT SUMMARY (most accurate): {answer}")
 
-                    # Include individual search results
+                    # Include individual search results with publication dates
                     results = data.get("results", [])
                     for res in results[:5]:
                         title = res.get("title", "")
                         url = res.get("url", "")
                         content = res.get("content", "")[:400]
+                        pub_date = res.get("published_date", "")
                         if title:
-                            parts.append(f"Source: {title}\nURL: {url}\nContent: {content}")
+                            date_note = f"Published: {pub_date}" if pub_date else "Date: unknown"
+                            parts.append(f"Source: {title}\n{date_note}\nURL: {url}\nContent: {content}")
 
                     if parts:
                         logger.info(f"Tavily: {len(results)} results for '{query}'")
@@ -801,17 +804,31 @@ async def fetch_finance_data(topic: str) -> str:
     return "\n\n".join(parts)
 
 # ── IMAGE ──
-async def fetch_image(query: str, category: str) -> str:
-    fallbacks = {
-        "entertainment": "https://images.unsplash.com/photo-1493225457124-a3eb161ffa5f?w=900&q=80",
-        "finance": "https://images.unsplash.com/photo-1611974789855-9c2a0a7236a3?w=900&q=80",
-        "tech": "https://images.unsplash.com/photo-1574944985070-8f3ebc6b79d2?w=900&q=80",
-        "health": "https://images.unsplash.com/photo-1559757148-5c350d0d3c56?w=900&q=80",
-        "education": "https://images.unsplash.com/photo-1523050854058-8df90110c9f1?w=900&q=80",
-        "news": "https://images.unsplash.com/photo-1508921912186-1d1a45ebb3c1?w=900&q=80",
-        "football": "https://images.unsplash.com/photo-1574629810360-7efbbe195018?w=900&q=80",
-    }
-    default = fallbacks.get(category, fallbacks["news"])
+async def fetch_image(query: str, category: str, article_title: str = "") -> str:
+    """
+    Fetch image for article.
+    Primary: Pollinations AI — generates relevant image from article title (free, no copyright)
+    Fallback: Unsplash → Pexels → category default
+    """
+    # Use article title for Pollinations if available, otherwise use query
+    image_prompt = article_title if article_title else query
+    # Clean for URL
+    clean_prompt = re.sub(r'[^a-zA-Z0-9\s]', '', image_prompt)[:100].strip()
+    clean_prompt = clean_prompt.replace(' ', '%20')
+
+    # Primary: Pollinations AI (free, copyright-free, topic-relevant)
+    try:
+        pollinations_url = f"https://image.pollinations.ai/prompt/{clean_prompt}%20Nigeria%20news%20photo%20realistic?width=900&height=500&nologo=true&seed={random.randint(1,9999)}"
+        # Verify it returns an image
+        async with httpx.AsyncClient(timeout=10) as client:
+            r = await client.head(pollinations_url)
+            if r.status_code == 200:
+                logger.info(f"Pollinations image generated for: {image_prompt[:50]}")
+                return pollinations_url
+    except Exception as e:
+        logger.info(f"Pollinations failed: {e}")
+
+    # Fallback: Unsplash
     try:
         if UNSPLASH_ACCESS_KEY:
             async with httpx.AsyncClient(timeout=8) as client:
@@ -824,6 +841,11 @@ async def fetch_image(query: str, category: str) -> str:
                     results = r.json().get("results", [])
                     if results:
                         return random.choice(results[:3])["urls"]["regular"]
+    except Exception as e:
+        logger.info(f"Unsplash failed: {e}")
+
+    # Fallback: Pexels
+    try:
         if PEXELS_API_KEY:
             async with httpx.AsyncClient(timeout=8) as client:
                 r = await client.get(
@@ -836,8 +858,19 @@ async def fetch_image(query: str, category: str) -> str:
                     if photos:
                         return random.choice(photos[:3])["src"]["large"]
     except Exception as e:
-        logger.error(f"Image fetch error: {e}")
-    return default
+        logger.info(f"Pexels failed: {e}")
+
+    # Final fallback: category default
+    fallbacks = {
+        "entertainment": "https://images.unsplash.com/photo-1493225457124-a3eb161ffa5f?w=900&q=80",
+        "finance": "https://images.unsplash.com/photo-1611974789855-9c2a0a7236a3?w=900&q=80",
+        "tech": "https://images.unsplash.com/photo-1574944985070-8f3ebc6b79d2?w=900&q=80",
+        "health": "https://images.unsplash.com/photo-1559757148-5c350d0d3c56?w=900&q=80",
+        "education": "https://images.unsplash.com/photo-1523050854058-8df90110c9f1?w=900&q=80",
+        "news": "https://images.unsplash.com/photo-1508921912186-1d1a45ebb3c1?w=900&q=80",
+        "football": "https://images.unsplash.com/photo-1574629810360-7efbbe195018?w=900&q=80",
+    }
+    return fallbacks.get(category, fallbacks["news"])
 
 # ── SLUG ──
 def slugify(text: str) -> str:
@@ -927,18 +960,21 @@ Category: {cat_context}
 Context: {source_note}{data_section}{extra_instructions}
 
 STRICT RULES — FOLLOW EXACTLY:
-1. ONLY use facts, figures, names, and statistics that appear in the VERIFIED REAL DATA provided above
+1. ONLY use facts, figures, names, and statistics from the VERIFIED REAL DATA above
 2. If a fact is NOT in the real data, DO NOT write it — leave it out completely
-3. NEVER add song titles, album names, award nominations, film titles, or player names from your own training knowledge unless they appear in the real data
+3. NEVER add song titles, album names, award nominations, film titles, or player names from your own training knowledge unless in the real data
 4. NEVER present government promises or pledges as confirmed facts — always say "the government says" or "according to officials"
 5. For government/economic articles: always include both positive indicators AND challenges/criticism — never one-sided reporting
-5. For government/economic articles: always include BOTH positive indicators AND challenges/criticism — never one-sided
 6. For health articles: always add disclaimer "Consult a doctor before taking any medication"
-7. For finance articles: never state a specific exchange rate unless it appears in the real data
-8. Write in clear simple English Nigerians understand — no grammar competition
-9. Minimum 400 words, 2-3 subheadings using <h2> tags
-10. Nigerian context throughout — naira prices, local brands, Nigerian cities where relevant
-11. NEVER write phrases like "as of my knowledge" or "I cannot confirm" — if you don't have data, write general guidance instead
+7. For finance/tech articles: present prices as RANGES not single figures. Never use "official price" for products without NGN official pricing — say "current market price" instead
+8. DATE RULE: Check the Published date on each source in the real data. ALWAYS use the most recent source when facts conflict. If an older article says a player is injured but a newer one says recovered — use the newer one. NEVER present a 2024 event as a new 2026 development — say "still in effect since 2024" or "introduced in April 2024"
+9. TRANSFER/RUMOUR RULE: Any unconfirmed transfer, signing, departure, or speculation must ALWAYS use "reportedly", "according to reports", or "sources claim" — NEVER state as confirmed fact
+10. SOURCE NAMING RULE: Use the exact source name from the data — if data says "Times Higher Education ranking", write that, not "NUC ranking"
+11. MATCH DATE RULE: If real data shows multiple matches between same teams, use the one with the MOST RECENT date — check the Date field carefully before writing
+12. Write in clear simple English Nigerians understand — no grammar competition
+13. Minimum 400 words, 2-3 subheadings using <h2> tags
+14. Nigerian context throughout — naira prices, local brands, Nigerian cities where relevant
+15. NEVER write phrases like "as of my knowledge" — if you don't have data, write general guidance
 
 Return ONLY this JSON — no markdown, no explanation, no preamble:
 {{
@@ -1305,7 +1341,7 @@ async def run_pipeline(force_category: str = None):
                     await send_to_all_admins(f"⚠️ Article for <b>{topic}</b> failed quality check: {reason}\nSkipping — try again later.")
                     continue
 
-                image_url = await fetch_image(article_data.get("image_query", topic), category)
+                image_url = await fetch_image(article_data.get("image_query", topic), category, article_data.get("title",""))
 
                 slug = slugify(article_data["title"])
                 conn = get_db()
