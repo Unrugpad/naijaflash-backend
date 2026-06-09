@@ -172,6 +172,21 @@ def init_db():
             added_by BIGINT,
             added_at TIMESTAMP DEFAULT NOW()
         );
+        CREATE TABLE IF NOT EXISTS ad_slots (
+            id SERIAL PRIMARY KEY,
+            slot_key VARCHAR(50) UNIQUE NOT NULL,
+            headline TEXT,
+            subtext TEXT,
+            link TEXT,
+            button_label VARCHAR(100),
+            is_active BOOLEAN DEFAULT TRUE,
+            updated_at TIMESTAMP DEFAULT NOW()
+        );
+        INSERT INTO ad_slots (slot_key, headline, subtext, link, button_label)
+        VALUES ('slot1', 'Convert Crypto to Naira Instantly — Best Rates Guaranteed',
+                'UnrugX Exchange · USDT, BTC, ETH · Instant bank transfer · No hidden fees',
+                'https://unrugx.com', 'Start Now →')
+        ON CONFLICT (slot_key) DO NOTHING;
         CREATE INDEX IF NOT EXISTS idx_articles_status ON articles(status);
         CREATE INDEX IF NOT EXISTS idx_articles_category ON articles(category);
         CREATE INDEX IF NOT EXISTS idx_articles_created ON articles(created_at DESC);
@@ -449,74 +464,243 @@ async def fetch_news_context(topic: str, category: str = "news") -> str:
     return ""
 
 # ── FETCH FOOTBALL DATA ──
-async def fetch_football_data(topic: str) -> str:
-    """Fetch real match stats from API-Football using smart team matching."""
+async def fetch_player_stats(player_name: str) -> str:
+    """Fetch season stats for a specific player from API-Football."""
     if not API_FOOTBALL_KEY:
         return ""
     try:
         async with httpx.AsyncClient(timeout=10) as client:
-            # Fetch both recent and upcoming fixtures
-            results = []
-            for endpoint_params in [{"last": 15}, {"next": 5}]:
+            # Search for player
+            r = await client.get(
+                "https://v3.football.api-sports.io/players",
+                params={"search": player_name, "season": datetime.now().year},
+                headers={"x-apisports-key": API_FOOTBALL_KEY}
+            )
+            if r.status_code != 200:
+                return ""
+            players = r.json().get("response", [])
+            if not players:
+                # Try previous season
                 r = await client.get(
-                    "https://v3.football.api-sports.io/fixtures",
-                    params={**endpoint_params, "timezone": "Africa/Lagos"},
+                    "https://v3.football.api-sports.io/players",
+                    params={"search": player_name, "season": datetime.now().year - 1},
                     headers={"x-apisports-key": API_FOOTBALL_KEY}
                 )
                 if r.status_code == 200:
-                    results.extend(r.json().get("response", []))
+                    players = r.json().get("response", [])
 
-            topic_lower = topic.lower()
-            # Extract meaningful words from topic (min 3 chars, not stopwords)
-            stopwords = {"versus","match","game","news","latest","today","result","score","update","vs","the","and","for"}
-            topic_words = [w for w in re.split(r'\W+', topic_lower) if len(w) >= 3 and w not in stopwords]
+            if not players:
+                return ""
 
-            relevant = []
-            for f in results:
-                home = f["teams"]["home"]["name"].lower()
-                away = f["teams"]["away"]["name"].lower()
-                league = f["league"]["name"].lower()
-                home_words = home.split()
-                away_words = away.split()
+            # Take the first/best match
+            p = players[0]
+            player = p.get("player", {})
+            stats_list = p.get("statistics", [])
 
-                matched = False
-                for tw in topic_words:
-                    if any(tw in hw for hw in home_words) or any(tw in aw for aw in away_words) or tw in league:
-                        matched = True
-                        break
+            if not stats_list:
+                return ""
 
-                if matched:
-                    h_score = f["goals"]["home"]
-                    a_score = f["goals"]["away"]
-                    status = f["fixture"]["status"]["long"]
-                    date = f["fixture"]["date"][:10]
+            # Aggregate stats across all competitions
+            total_goals = sum(s.get("goals", {}).get("total", 0) or 0 for s in stats_list)
+            total_assists = sum(s.get("goals", {}).get("assists", 0) or 0 for s in stats_list)
+            total_apps = sum(s.get("games", {}).get("appearences", 0) or 0 for s in stats_list)
+            total_mins = sum(s.get("games", {}).get("minutes", 0) or 0 for s in stats_list)
+            total_yellow = sum(s.get("cards", {}).get("yellow", 0) or 0 for s in stats_list)
+            total_red = sum(s.get("cards", {}).get("red", 0) or 0 for s in stats_list)
+            avg_rating = None
+            ratings = [float(s.get("games", {}).get("rating", 0) or 0) for s in stats_list if s.get("games", {}).get("rating")]
+            if ratings:
+                avg_rating = sum(ratings) / len(ratings)
 
-                    # Build detailed match info
-                    match_info = [
-                        f"Match: {f['teams']['home']['name']} vs {f['teams']['away']['name']}",
-                        f"Score: {h_score} - {a_score}" if h_score is not None else "Score: Not yet played",
-                        f"Status: {status}",
-                        f"Date: {date}",
-                        f"League: {f['league']['name']}",
-                        f"Round: {f['league'].get('round','')}"
-                    ]
+            # Best competition (most appearances)
+            best_comp = max(stats_list, key=lambda s: s.get("games", {}).get("appearences", 0) or 0)
+            comp_name = best_comp.get("league", {}).get("name", "Unknown League")
+            club_name = best_comp.get("team", {}).get("name", "Unknown Club")
 
-                    # Add scorers if available
-                    events = f.get("events", [])
-                    goals = [e for e in events if e.get("type") == "Goal"]
+            season_year = datetime.now().year
+            lines = [
+                f"Player: {player.get('name', player_name)}",
+                f"Age: {player.get('age', 'N/A')} | Nationality: {player.get('nationality', 'N/A')}",
+                f"Club: {club_name} | Competition: {comp_name}",
+                f"Season: {season_year-1}/{season_year}",
+                f"Appearances: {total_apps} | Minutes: {total_mins}",
+                f"Goals: {total_goals} | Assists: {total_assists}",
+                f"Yellow Cards: {total_yellow} | Red Cards: {total_red}",
+            ]
+            if avg_rating:
+                lines.append(f"Average Rating: {avg_rating:.1f}/10")
+
+            # Add shot stats from best competition
+            shots_total = best_comp.get("shots", {}).get("total", 0) or 0
+            shots_on = best_comp.get("shots", {}).get("on", 0) or 0
+            if shots_total:
+                lines.append(f"Shots: {shots_total} total, {shots_on} on target")
+
+            # Pass stats
+            pass_acc = best_comp.get("passes", {}).get("accuracy", 0) or 0
+            if pass_acc:
+                lines.append(f"Pass Accuracy: {pass_acc}%")
+
+            logger.info(f"API-Football player stats: found {player.get('name')} with {total_goals} goals")
+            return "\n".join(lines)
+
+    except Exception as e:
+        logger.error(f"Player stats error: {e}")
+    return ""
+
+async def fetch_match_player_stats(fixture_id: int) -> str:
+    """Fetch per-player stats for a specific match."""
+    if not API_FOOTBALL_KEY:
+        return ""
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            r = await client.get(
+                f"https://v3.football.api-sports.io/fixtures/players",
+                params={"fixture": fixture_id},
+                headers={"x-apisports-key": API_FOOTBALL_KEY}
+            )
+            if r.status_code != 200:
+                return ""
+            teams_data = r.json().get("response", [])
+            if not teams_data:
+                return ""
+
+            lines = ["Player Ratings & Stats From This Match:"]
+            for team_data in teams_data[:2]:  # Both teams
+                team_name = team_data.get("team", {}).get("name", "")
+                players = team_data.get("players", [])
+                team_lines = [f"\n{team_name}:"]
+                for p in players[:11]:  # Starting 11
+                    pname = p.get("player", {}).get("name", "")
+                    stats = p.get("statistics", [{}])[0] if p.get("statistics") else {}
+                    rating = stats.get("games", {}).get("rating", "N/A")
+                    goals = stats.get("goals", {}).get("total", 0) or 0
+                    assists = stats.get("goals", {}).get("assists", 0) or 0
+                    minutes = stats.get("games", {}).get("minutes", 0) or 0
+                    line = f"  {pname} — Rating: {rating}/10, {minutes}' played"
                     if goals:
-                        goal_lines = []
-                        for g in goals:
-                            scorer = g.get("player",{}).get("name","Unknown")
-                            minute = g.get("time",{}).get("elapsed","?")
-                            team = g.get("team",{}).get("name","")
-                            goal_lines.append(f"{scorer} ({team}) {minute}'")
-                        match_info.append("Goals: " + ", ".join(goal_lines))
+                        line += f", {goals} goal{'s' if goals > 1 else ''}"
+                    if assists:
+                        line += f", {assists} assist{'s' if assists > 1 else ''}"
+                    team_lines.append(line)
+                lines.extend(team_lines)
+            return "\n".join(lines)
+    except Exception as e:
+        logger.error(f"Match player stats error: {e}")
+    return ""
 
-                    relevant.append("\n".join(match_info))
+async def fetch_football_data(topic: str) -> str:
+    """
+    Fetch real football data:
+    - For match topics (X vs Y): match result + scorers + player ratings
+    - For player topics: full season stats
+    """
+    if not API_FOOTBALL_KEY:
+        return ""
+
+    topic_lower = topic.lower()
+    stopwords = {"versus","match","game","news","latest","today","result","score","update","vs","the","and","for","stats","statistics"}
+    topic_words = [w for w in re.split(r'\W+', topic_lower) if len(w) >= 3 and w not in stopwords]
+
+    is_match_topic = bool(re.search(r'\bvs?\b', topic_lower) or ' v ' in topic_lower)
+
+    try:
+        async with httpx.AsyncClient(timeout=12) as client:
+            # ── MATCH TOPIC ──
+            if is_match_topic:
+                results = []
+                for params in [{"last": 15}, {"next": 5}]:
+                    r = await client.get(
+                        "https://v3.football.api-sports.io/fixtures",
+                        params={**params, "timezone": "Africa/Lagos"},
+                        headers={"x-apisports-key": API_FOOTBALL_KEY}
+                    )
+                    if r.status_code == 200:
+                        results.extend(r.json().get("response", []))
+
+                relevant = []
+                best_fixture_id = None
+                for f in results:
+                    home = f["teams"]["home"]["name"].lower()
+                    away = f["teams"]["away"]["name"].lower()
+                    league = f["league"]["name"].lower()
+                    home_words = home.split()
+                    away_words = away.split()
+                    matched = False
+                    for tw in topic_words:
+                        if any(tw in hw for hw in home_words) or any(tw in aw for aw in away_words) or tw in league:
+                            matched = True
+                            break
+                    if matched:
+                        h_score = f["goals"]["home"]
+                        a_score = f["goals"]["away"]
+                        status = f["fixture"]["status"]["long"]
+                        date = f["fixture"]["date"][:10]
+                        fixture_id = f["fixture"]["id"]
+
+                        match_info = [
+                            f"Match: {f['teams']['home']['name']} vs {f['teams']['away']['name']}",
+                            f"Score: {h_score} - {a_score}" if h_score is not None else "Score: Not yet played",
+                            f"Status: {status}",
+                            f"Date: {date}",
+                            f"League: {f['league']['name']}",
+                            f"Round: {f['league'].get('round','')}"
+                        ]
+
+                        # Add goal scorers from events
+                        events = f.get("events", [])
+                        goals = [e for e in events if e.get("type") == "Goal"]
+                        if goals:
+                            goal_lines = []
+                            for g in goals:
+                                scorer = g.get("player",{}).get("name","Unknown")
+                                minute = g.get("time",{}).get("elapsed","?")
+                                team = g.get("team",{}).get("name","")
+                                goal_lines.append(f"{scorer} ({team}) {minute}'")
+                            match_info.append("Goal Scorers: " + ", ".join(goal_lines))
+
+                        relevant.append("\n".join(match_info))
+
+                        # Save fixture ID for player stats fetch (most recent match)
+                        if h_score is not None and best_fixture_id is None:
+                            best_fixture_id = fixture_id
+
                 if relevant:
-                    logger.info(f"API-Football: {len(relevant)} fixtures for '{topic}'")
-                    return "\n\n".join(relevant[:3])
+                    result_text = "\n\n".join(relevant[:2])
+                    # Also fetch per-player match stats if match is finished
+                    if best_fixture_id:
+                        player_stats = await fetch_match_player_stats(best_fixture_id)
+                        if player_stats:
+                            result_text += f"\n\n{player_stats}"
+                    logger.info(f"API-Football match data fetched for: {topic}")
+                    return result_text
+
+            # ── PLAYER / TEAM TOPIC ──
+            else:
+                parts = []
+
+                # Step 1: Find out WHY the player/team is trending using Tavily
+                why_trending = await fetch_news_context(topic, "football")
+                if why_trending:
+                    parts.append(f"WHY THIS IS TRENDING (use this as the main story angle):\n{why_trending}")
+
+                # Step 2: Get their season stats from API-Football for supporting data
+                for name in topic_words:
+                    if len(name) >= 4:
+                        stats = await fetch_player_stats(name)
+                        if stats:
+                            parts.append(f"PLAYER SEASON STATS (use as supporting data):\n{stats}")
+                            break
+                # Fallback: try full topic as player name
+                if len(parts) < 2:
+                    stats = await fetch_player_stats(topic)
+                    if stats:
+                        parts.append(f"PLAYER SEASON STATS (use as supporting data):\n{stats}")
+
+                if parts:
+                    logger.info(f"API-Football player topic data fetched for: {topic}")
+                    return "\n\n".join(parts)
+
     except Exception as e:
         logger.error(f"API-Football error: {e}")
     return ""
@@ -654,11 +838,16 @@ async def generate_article(topic: str, category: str, real_data: str = "", is_ev
     if category == "football":
         extra_instructions = (
             "\nFOOTBALL RULES:"
-            "\n- If real data shows a COMPLETED match: write in PAST TENSE, include exact scoreline, goalscorers with minutes, player ratings 1-10, key moments"
-            "\n- If real data shows an UPCOMING match: write FUTURE TENSE preview, include team form, key players to watch, prediction"
+            "\n- SCORES RULE: Use ONLY the score from 'AUTHORITATIVE MATCH DATA' section. NEVER use a score from news context or Tavily results."
+            "\n- If no AUTHORITATIVE MATCH DATA score exists, do NOT write any scoreline — write a preview or general article instead"
+            "\n- If real data shows a COMPLETED match: write PAST TENSE, exact scoreline, goalscorers with minutes, player ratings 1-10"
+            "\n- If real data shows an UPCOMING match: write FUTURE TENSE preview, team form, key players, prediction"
             "\n- NEVER describe a completed match as upcoming or vice versa"
             "\n- Write a descriptive headline e.g. 'Mbappé Hat-Trick Fires France Past Nigeria 3-0' not just 'France vs Nigeria'"
-            "\n- NEVER fabricate scorelines, goalscorers, or match stats not in the real data"
+            "\n- For player topics: the 'WHY THIS IS TRENDING' section is your main story angle — write about that specific reason"
+            "\n- Use 'PLAYER SEASON STATS' as supporting data to enrich the article — include key numbers naturally in the text"
+            "\n- Example: if trending because of transfer, write transfer article and include his stats as 'here is what the buying club is getting'"
+            "\n- Always include a Nigerian angle: Super Eagles fans' view, Nigerian players involved, or what it means for Nigerian football"
         )
     elif category == "finance":
         extra_instructions = (
@@ -978,8 +1167,20 @@ async def run_pipeline(force_category: str = None):
 
                 if category == "football":
                     football_data = await fetch_football_data(topic)
-                    news_data = await fetch_news_context(topic, category)
-                    real_data = "\n\n".join(filter(None, [football_data, news_data]))
+                    is_match = bool(re.search(r'\bvs?\b', topic.lower()) or ' v ' in topic.lower())
+                    if is_match:
+                        # For matches: football_data has match result, get additional news context
+                        news_data = await fetch_news_context(topic, category)
+                        if football_data:
+                            real_data = f"AUTHORITATIVE MATCH DATA (use this for scores/results):\n{football_data}"
+                            if news_data:
+                                real_data += f"\n\nNEWS CONTEXT (for quotes/background only — never use for scores):\n{news_data}"
+                        else:
+                            real_data = news_data
+                    else:
+                        # For player/team topics: fetch_football_data already includes
+                        # why-trending context + stats — no need to call news again
+                        real_data = football_data
                 elif category == "finance":
                     # Always fetch live rates for finance
                     finance_data = await fetch_finance_data(topic)
@@ -1027,10 +1228,6 @@ async def run_pipeline(force_category: str = None):
             await send_to_all_admins("⚠️ Pipeline ran but failed to generate articles. Check Railway logs.")
         else:
             logger.info(f"Pipeline {label} done. {generated} articles generated.")
-
-    except Exception as e:
-        logger.error(f"Pipeline error: {e}")
-        await send_to_all_admins(f"⚠️ Pipeline error: {str(e)[:200]}")
 
     except Exception as e:
         logger.error(f"Pipeline error: {e}")
@@ -1120,6 +1317,42 @@ async def trigger_pipeline(background_tasks: BackgroundTasks):
     background_tasks.add_task(run_pipeline)
     return {"status": "Pipeline started"}
 
+@app.get("/api/ads/slot1")
+async def get_ad_slot1():
+    """Get the active ad for slot 1 — used by the frontend."""
+    try:
+        conn = get_db()
+        cur = conn.cursor()
+        cur.execute("SELECT * FROM ad_slots WHERE slot_key='slot1' AND is_active=TRUE")
+        ad = cur.fetchone()
+        cur.close()
+        conn.close()
+        if not ad:
+            return {"active": False}
+        return {
+            "active": True,
+            "headline": ad["headline"],
+            "subtext": ad["subtext"],
+            "link": ad["link"],
+            "button_label": ad["button_label"],
+        }
+    except Exception as e:
+        logger.error(f"Ad fetch error: {e}")
+        return {"active": False}
+
+@app.delete("/api/articles/{article_id}")
+async def delete_article(article_id: int):
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute("DELETE FROM articles WHERE id=%s RETURNING id, title", (article_id,))
+    row = cur.fetchone()
+    conn.commit()
+    cur.close()
+    conn.close()
+    if not row:
+        raise HTTPException(status_code=404, detail="Article not found")
+    return {"success": True, "deleted": dict(row)}
+
 @app.get("/api/health")
 async def health():
     try:
@@ -1198,6 +1431,11 @@ async def telegram_webhook(request: Request):
                     "/football ⚽ /finance 💰 /entertainment 🎭\n"
                     "/tech 📱 /health 🏥 /education 📚 /news 📰\n\n"
                     "/pending — View pending articles\n"
+                    "/delete [id] — Delete an article by ID\n\n"
+                    "<b>Ad Management:</b>\n"
+                    "/viewad — See current ad slot\n"
+                    "/setad Headline | Subtext | Link | Button — Update ad\n"
+                    "/clearad — Remove current ad\n\n"
                     "/help — Show this message"
                 )
                 if is_owner(user_id):
@@ -1355,6 +1593,120 @@ async def telegram_webhook(request: Request):
                     )
                 except Exception as e:
                     await send_telegram(chat_id, f"❌ Reset error: {e}")
+
+            elif text.startswith("/delete"):
+                if not is_admin(user_id):
+                    await send_telegram(chat_id, "⛔ Admins only.")
+                    return {"ok": True}
+                parts = text.split()
+                if len(parts) < 2:
+                    await send_telegram(chat_id, "Usage: /delete [article_id]")
+                    return {"ok": True}
+                try:
+                    article_id = int(parts[1])
+                    conn = get_db()
+                    cur = conn.cursor()
+                    cur.execute("SELECT title, status FROM articles WHERE id=%s", (article_id,))
+                    row = cur.fetchone()
+                    if not row:
+                        await send_telegram(chat_id, f"❌ Article #{article_id} not found.")
+                        cur.close()
+                        conn.close()
+                        return {"ok": True}
+                    cur.execute("DELETE FROM articles WHERE id=%s", (article_id,))
+                    conn.commit()
+                    cur.close()
+                    conn.close()
+                    await send_to_all_admins(
+                        f"🗑️ <b>Article Deleted</b>\n\n"
+                        f"ID: #{article_id}\n"
+                        f"Title: {row['title']}\n"
+                        f"Deleted by: {user_id}"
+                    )
+                except ValueError:
+                    await send_telegram(chat_id, "❌ Invalid article ID. Usage: /delete [number]")
+                except Exception as e:
+                    await send_telegram(chat_id, f"❌ Error: {e}")
+
+            elif text.startswith("/setad"):
+                if not is_admin(user_id):
+                    await send_telegram(chat_id, "⛔ Admins only.")
+                    return {"ok": True}
+                # Format: /setad Headline | Subtext | Link | Button Label
+                content = text[len("/setad"):].strip()
+                if "|" not in content:
+                    await send_telegram(chat_id,
+                        "Usage: /setad Headline | Subtext | Link | Button Label\n\n"
+                        "Example:\n/setad Get 60% Off Phones | Best deals on Jumia | https://jumia.com.ng | Shop Now →"
+                    )
+                    return {"ok": True}
+                try:
+                    parts_ad = [p.strip() for p in content.split("|")]
+                    headline = parts_ad[0] if len(parts_ad) > 0 else ""
+                    subtext = parts_ad[1] if len(parts_ad) > 1 else ""
+                    link = parts_ad[2] if len(parts_ad) > 2 else ""
+                    button_label = parts_ad[3] if len(parts_ad) > 3 else "Learn More"
+                    conn = get_db()
+                    cur = conn.cursor()
+                    cur.execute("""
+                        UPDATE ad_slots SET headline=%s, subtext=%s, link=%s, button_label=%s,
+                        is_active=TRUE, updated_at=NOW() WHERE slot_key='slot1'
+                    """, (headline, subtext, link, button_label))
+                    conn.commit()
+                    cur.close()
+                    conn.close()
+                    await send_telegram(chat_id,
+                        f"✅ <b>Ad Slot 1 Updated</b>\n\n"
+                        f"<b>Headline:</b> {headline}\n"
+                        f"<b>Subtext:</b> {subtext}\n"
+                        f"<b>Link:</b> {link}\n"
+                        f"<b>Button:</b> {button_label}"
+                    )
+                except Exception as e:
+                    await send_telegram(chat_id, f"❌ Error updating ad: {e}")
+
+            elif text == "/clearad":
+                if not is_admin(user_id):
+                    await send_telegram(chat_id, "⛔ Admins only.")
+                    return {"ok": True}
+                try:
+                    conn = get_db()
+                    cur = conn.cursor()
+                    cur.execute("UPDATE ad_slots SET is_active=FALSE, updated_at=NOW() WHERE slot_key='slot1'")
+                    conn.commit()
+                    cur.close()
+                    conn.close()
+                    await send_telegram(chat_id, "✅ Ad Slot 1 cleared. No ad will show until you set a new one.")
+                except Exception as e:
+                    await send_telegram(chat_id, f"❌ Error: {e}")
+
+            elif text == "/viewad":
+                if not is_admin(user_id):
+                    await send_telegram(chat_id, "⛔ Admins only.")
+                    return {"ok": True}
+                try:
+                    conn = get_db()
+                    cur = conn.cursor()
+                    cur.execute("SELECT * FROM ad_slots WHERE slot_key='slot1'")
+                    ad = cur.fetchone()
+                    cur.close()
+                    conn.close()
+                    if not ad:
+                        await send_telegram(chat_id, "No ad configured.")
+                    elif not ad["is_active"]:
+                        await send_telegram(chat_id, "Ad Slot 1 is currently <b>inactive</b>.\nUse /setad to activate.")
+                    else:
+                        await send_telegram(chat_id,
+                            f"📢 <b>Current Ad Slot 1</b>\n\n"
+                            f"<b>Headline:</b> {ad['headline']}\n"
+                            f"<b>Subtext:</b> {ad['subtext']}\n"
+                            f"<b>Link:</b> {ad['link']}\n"
+                            f"<b>Button:</b> {ad['button_label']}\n"
+                            f"<b>Status:</b> ✅ Active\n"
+                            f"<b>Updated:</b> {str(ad['updated_at'])[:16]}"
+                        )
+                except Exception as e:
+                    await send_telegram(chat_id, f"❌ Error: {e}")
 
     except Exception as e:
         logger.error(f"Webhook error: {e}")
