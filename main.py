@@ -357,12 +357,101 @@ CATEGORY_TREND_QUERIES = {
     "news": "Nigeria breaking news politics government today",
 }
 
+# ── WEBSITE NAME DETECTION ──
+WEBSITE_NAME_PATTERNS = [
+    r'(\.ng|\.com|\.org|\.net)\s*[-–|]',
+    r'[-–|]\s*(news|gist|blog|updates|latest|today|ng|media|online|tv|fm)$',
+    r'^(myschool|legit|vanguard|punch|guardian|thisday|channels|arise|sahara)',
+    r'(nairaland|naijaloaded|linda ikeji|bellanaija|pulse\.ng|nairametrics)',
+    r'^(google news|yahoo news|bing news|breaking news|latest news)',
+    r'(schools and exams news|celebrity gist|breaking news, latest stories)',
+    r'^\w[\w\s]{2,20}\s*[-–|:]\s*(news|updates|gist|latest|today|ng)$',
+    r'(the world\'s no\.|#\d+ source|no\. ?1 source)',
+    r'(archives?|category|tag|page \d|section)\s*$',
+    r'^(nigeria|nigerian)\s+(politics|finance|health|education|entertainment|tech|sports)\s+news\s*[|\-–]',
+    r'(state house|aso rock|presidency)\s*,?\s*abuja\s*$',
+]
+
+def is_website_name(title: str) -> bool:
+    t = title.lower().strip()
+    for pattern in WEBSITE_NAME_PATTERNS:
+        if re.search(pattern, t):
+            return True
+    words = t.split()
+    generic = {"news","latest","updates","gist","today","breaking","stories","headlines"}
+    if len(words) <= 4 and len(set(words) - generic) <= 2:
+        return True
+    return False
+
+def extract_best_headline(page_title: str, content: str, category: str) -> Optional[str]:
+    """Extract the best news headline from a Tavily result."""
+
+    # Try page title first if it looks like a real headline
+    if page_title and not is_website_name(page_title):
+        # Clean source name from end: "Title - Source Name" -> "Title"
+        clean = re.sub(r'\s*[-–|]\s*[A-Z][A-Za-z\s\.]{2,30}$', '', page_title).strip()
+        clean = re.sub(r'^\d{1,2}[\/\-]\d{1,2}[\/\-]\d{2,4}\s*[-–]\s*', '', clean).strip()
+        if len(clean) >= 25 and not is_website_name(clean):
+            return clean
+
+    # Extract from content — find sentence that reads like news
+    if not content:
+        return None
+
+    sentences = re.split(r'(?<=[.!?])\s+|\n', content)
+    news_words = {
+        'announce','reveal','confirm','launch','release','approve','win','lose',
+        'beat','score','sign','hire','fire','arrest','accuse','deny','warn',
+        'hit','rise','fall','drop','increase','reach','naira','dollar','jamb',
+        'waec','neco','police','court','government','president','minister',
+        'governor','senate','million','billion','₦','$','%','vs','defeat',
+        'victory','draw','qualify','dead','kill','attack','bomb','crash',
+        'flood','outbreak','ban','suspend','resign','appoint','sack','probe'
+    }
+
+    for sent in sentences:
+        sent = sent.strip()
+        if len(sent) < 25 or len(sent) > 180:
+            continue
+        if is_website_name(sent):
+            continue
+        sent_lower = sent.lower()
+        if sum(1 for w in news_words if w in sent_lower) >= 1:
+            return sent[:150]
+
+    return None
+
+def deduplicate_topics(topics: List[dict]) -> List[dict]:
+    """Remove duplicate topics — keep only one per similar story."""
+    unique = []
+    seen_keywords = []
+    stopwords = {"nigeria","nigerian","latest","news","today","breaking","update",
+                 "about","with","from","that","this","will","have","been","their",
+                 "would","could","should","after","before","during","while","says",
+                 "said","also","just","over","more","into","than","then","when"}
+
+    for topic in topics:
+        t = topic["topic"].lower()
+        keywords = set(w for w in re.findall(r'\b\w{5,}\b', t) if w not in stopwords)
+        if not keywords:
+            continue
+        is_dup = any(len(keywords & seen) >= 2 for seen in seen_keywords)
+        if not is_dup:
+            unique.append(topic)
+            seen_keywords.append(keywords)
+
+    return unique
+
 async def fetch_topics_from_tavily(category: str, query: str) -> List[dict]:
-    """Use Tavily to discover trending topics for a specific category."""
+    """
+    Discover real trending topics using Tavily.
+    Extracts actual news headlines from content — not website page titles.
+    """
     if not TAVILY_API_KEY:
         return []
     topics = []
     seen = set()
+
     try:
         async with httpx.AsyncClient(timeout=15) as client:
             r = await client.post(
@@ -371,52 +460,73 @@ async def fetch_topics_from_tavily(category: str, query: str) -> List[dict]:
                     "api_key": TAVILY_API_KEY,
                     "query": query,
                     "search_depth": "basic",
-                    "max_results": 7,
+                    "max_results": 8,
                     "include_answer": False,
                     "sort_by": "date",
                 }
             )
-            if r.status_code == 200:
-                results = r.json().get("results", [])
-                for res in results:
-                    title = res.get("title", "").strip()
-                    # Clean up title — remove source names and dates
-                    title = re.sub(r'\s*[-–|]\s*\w+[\w\s]*$', '', title).strip()
-                    title = re.sub(r'^\d{1,2}/\d{1,2}/\d{4}\s*[-–]\s*', '', title).strip()
-                    if len(title) < 10 or title in seen:
-                        continue
-                    seen.add(title)
-                    # Verify it matches the intended category
-                    detected_cat = classify_topic(title)
-                    final_cat = detected_cat if detected_cat else category
-                    topics.append({
-                        "topic": title,
-                        "category": final_cat,
-                        "source": "tavily_discovery"
-                    })
-        logger.info(f"Tavily discovery [{category}]: {len(topics)} topics")
+            if r.status_code != 200:
+                return []
+
+            results = r.json().get("results", [])
+
+            for res in results:
+                page_title = res.get("title", "").strip()
+                content = res.get("content", "").strip()
+                url = res.get("url", "")
+
+                # Skip aggregator/index pages
+                skip_domains = ["google.com","bing.com","yahoo.com","reddit.com",
+                                "wikipedia.org","facebook.com","twitter.com","x.com",
+                                "youtube.com","instagram.com"]
+                if any(d in url for d in skip_domains):
+                    continue
+
+                # Extract best headline
+                headline = extract_best_headline(page_title, content, category)
+                if not headline:
+                    continue
+
+                h_lower = headline.lower()
+                if h_lower in seen:
+                    continue
+                seen.add(h_lower)
+
+                # Classify
+                detected_cat = classify_topic(headline)
+                final_cat = detected_cat if detected_cat else category
+
+                topics.append({
+                    "topic": headline,
+                    "category": final_cat,
+                    "source": "tavily_discovery",
+                    "context": content[:600]
+                })
+
+        logger.info(f"Tavily [{category}]: {len(topics)} real headlines extracted")
+
     except Exception as e:
         logger.error(f"Tavily discovery error [{category}]: {e}")
+
     return topics
 
 async def fetch_nigeria_trends() -> List[dict]:
     """
     Discover trending Nigerian topics using Tavily.
-    Searches across all 7 categories to get diverse, real Nigerian news.
-    Also tries Google Trends RSS as a bonus source.
+    Searches across all 7 categories concurrently.
+    Deduplicates similar stories before returning.
     """
     all_topics = []
     seen_topics = set()
 
-    def add_topic(topic: str, category: str, source: str = "tavily"):
-        t = topic.strip()
+    def add_topic(topic_dict: dict):
+        t = topic_dict["topic"].strip()
         t_lower = t.lower()
-        if t_lower in seen_topics or len(t) < 8:
+        if t_lower in seen_topics or len(t) < 15:
             return
         seen_topics.add(t_lower)
-        all_topics.append({"topic": t, "category": category, "source": source})
+        all_topics.append(topic_dict)
 
-    # ── Primary: Tavily searches across all categories ──
     # Run all category searches concurrently
     tasks = [
         fetch_topics_from_tavily(cat, query)
@@ -427,48 +537,45 @@ async def fetch_nigeria_trends() -> List[dict]:
     for cat_topics in results:
         if isinstance(cat_topics, list):
             for t in cat_topics:
-                add_topic(t["topic"], t["category"], "tavily_discovery")
+                add_topic(t)
 
-    # ── Bonus: Google Trends RSS (if it works) ──
+    # Bonus: Google Trends RSS if available
     try:
-        async with httpx.AsyncClient(timeout=10) as client:
+        async with httpx.AsyncClient(timeout=8) as client:
             r = await client.get(
                 "https://trends.google.com/trending/rss?geo=NG",
                 headers={"User-Agent": "Mozilla/5.0 (compatible; NaijaFlash/1.0)"}
             )
             if r.status_code == 200:
                 root = ET.fromstring(r.text)
-                items = root.findall(".//item")
                 now = datetime.now(timezone.utc)
-                for item in items:
+                for item in root.findall(".//item"):
                     title_el = item.find("title")
                     pubdate_el = item.find("pubDate")
                     if title_el is None or not title_el.text:
                         continue
                     topic = title_el.text.strip()
-                    # Recency check
                     if pubdate_el is not None and pubdate_el.text:
                         try:
                             pub_dt = parsedate_to_datetime(pubdate_el.text)
-                            age_hours = (now - pub_dt).total_seconds() / 3600
-                            if age_hours > 24:
+                            if (now - pub_dt).total_seconds() / 3600 > 24:
                                 continue
                         except Exception:
                             pass
                     cat = classify_topic(topic)
-                    if cat:
-                        add_topic(topic, cat, "google_trends")
-                logger.info(f"Google Trends RSS bonus: added {len([t for t in all_topics if t.get('source')=='google_trends'])} topics")
+                    if cat and not is_website_name(topic):
+                        add_topic({"topic": topic, "category": cat, "source": "google_trends"})
     except Exception as e:
-        logger.info(f"Google Trends RSS unavailable (expected on Railway): {e}")
+        logger.info(f"Google Trends RSS unavailable: {e}")
 
-    logger.info(f"Total trends discovered: {len(all_topics)} across all categories")
+    # Deduplicate similar stories
+    all_topics = deduplicate_topics(all_topics)
 
-    # Log breakdown by category
+    # Log breakdown
     cat_counts = {}
     for t in all_topics:
         cat_counts[t["category"]] = cat_counts.get(t["category"], 0) + 1
-    logger.info(f"Category breakdown: {cat_counts}")
+    logger.info(f"Trends after dedup: {len(all_topics)} topics | {cat_counts}")
 
     return all_topics
 
@@ -1176,14 +1283,16 @@ STRICT RULES — FOLLOW EXACTLY:
 5. For government/economic articles: always include both positive indicators AND challenges/criticism — never one-sided reporting
 6. For health articles: always add disclaimer "Consult a doctor before taking any medication"
 7. For finance/tech articles: present prices as RANGES not single figures. Never use "official price" for products without NGN official pricing — say "current market price" instead
-8. DATE RULE: Check the Published date on each source in the real data. ALWAYS use the most recent source when facts conflict. If an older article says a player is injured but a newer one says recovered — use the newer one. NEVER present a 2024 event as a new 2026 development — say "still in effect since 2024" or "introduced in April 2024"
-9. TRANSFER/RUMOUR RULE: Any unconfirmed transfer, signing, departure, or speculation must ALWAYS use "reportedly", "according to reports", or "sources claim" — NEVER state as confirmed fact
+8. DATE RULE: Check the Published date on each source in the real data. ALWAYS use the most recent source when facts conflict. NEVER present a 2024 event as a new 2026 development
+9. TRANSFER/RUMOUR RULE: Any unconfirmed transfer, signing, departure, or speculation must ALWAYS use "reportedly", "according to reports", or "sources claim"
 10. SOURCE NAMING RULE: Use the exact source name from the data — if data says "Times Higher Education ranking", write that, not "NUC ranking"
-11. MATCH DATE RULE: If real data shows multiple matches between same teams, use the one with the MOST RECENT date — check the Date field carefully before writing
-12. Write in clear simple English Nigerians understand — no grammar competition
-13. Minimum 400 words, 2-3 subheadings using <h2> tags
-14. Nigerian context throughout — naira prices, local brands, Nigerian cities where relevant
-15. NEVER write phrases like "as of my knowledge" — if you don't have data, write general guidance
+11. MATCH DATE RULE: If real data shows multiple matches between same teams, use the one with the MOST RECENT date
+12. NIGERIA WORLD CUP RULE: Nigeria did NOT qualify for the 2026 FIFA World Cup. NEVER write articles about Nigeria preparing for or participating in the 2026 World Cup
+13. SINGLE STORY RULE: Write about ONE story only. Do not combine unrelated stories (e.g. economy + Ebola) into one article. Pick the main story from the data and focus on it
+14. Write in clear simple English Nigerians understand — no grammar competition
+15. Minimum 400 words, 2-3 subheadings using <h2> tags
+16. Nigerian context throughout — naira prices, local brands, Nigerian cities where relevant
+17. NEVER write phrases like "as of my knowledge" — if you don't have data, write general guidance
 
 Return ONLY this JSON — no markdown, no explanation, no preamble:
 {{
@@ -1513,15 +1622,17 @@ async def run_pipeline(force_category: str = None):
             topic = trend["topic"]
             category = trend["category"]
             is_evergreen = trend.get("source") == "evergreen"
+            # Context from Tavily discovery — pre-fetched news snippet
+            tavily_context = trend.get("context", "")
+
             try:
-                logger.info(f"Processing [{category}]{'[evergreen]' if is_evergreen else '[trending]'}: {topic}")
+                logger.info(f"Processing [{category}]{'[evergreen]' if is_evergreen else '[trending]'}: {topic[:60]}")
                 real_data = ""
 
                 if category == "football":
                     football_data = await fetch_football_data(topic)
                     is_match = bool(re.search(r'\bvs?\b', topic.lower()) or ' v ' in topic.lower())
                     if is_match:
-                        # For matches: football_data has match result, get additional news context
                         news_data = await fetch_news_context(topic, category)
                         if football_data:
                             real_data = f"AUTHORITATIVE MATCH DATA (use this for scores/results):\n{football_data}"
@@ -1530,16 +1641,17 @@ async def run_pipeline(force_category: str = None):
                         else:
                             real_data = news_data
                     else:
-                        # For player/team topics: fetch_football_data already includes
-                        # why-trending context + stats — no need to call news again
                         real_data = football_data
                 elif category == "finance":
-                    # Always fetch live rates for finance
                     finance_data = await fetch_finance_data(topic)
                     news_data = await fetch_news_context(topic, category)
                     real_data = "\n\n".join(filter(None, [finance_data, news_data]))
                 else:
                     real_data = await fetch_news_context(topic, category)
+
+                # Add Tavily discovery context if we have it and it's not already in real_data
+                if tavily_context and tavily_context not in real_data:
+                    real_data = f"DISCOVERY CONTEXT:\n{tavily_context}\n\n{real_data}".strip()
 
                 article_data = await generate_article(topic, category, real_data, is_evergreen)
 
@@ -1882,8 +1994,7 @@ async def telegram_webhook(request: Request):
                     "🤖 <b>NaijaFlash Bot Commands</b>\n\n"
                     "/stats — Blog statistics (daily/weekly/monthly)\n"
                     "/trends — See what's trending in Nigeria now\n"
-                    "/generate — Generate articles from all trends\n"
-                    "/generate [category] — Generate from specific category\n\n"
+                    "/generate — Generate articles (add category name for specific e.g. /generate football)\n\n"
                     "<b>Category Shortcuts:</b>\n"
                     "/football ⚽ /finance 💰 /entertainment 🎭\n"
                     "/tech 📱 /health 🏥 /education 📚 /news 📰\n\n"
