@@ -676,6 +676,8 @@ async def fetch_football_data(topic: str) -> str:
 
                 relevant = []
                 best_fixture_id = None
+                # Sort by date descending — most recent match first
+                results.sort(key=lambda x: x["fixture"]["date"], reverse=True)
                 for f in results:
                     home = f["teams"]["home"]["name"].lower()
                     away = f["teams"]["away"]["name"].lower()
@@ -693,10 +695,24 @@ async def fetch_football_data(topic: str) -> str:
                         status = f["fixture"]["status"]["long"]
                         date = f["fixture"]["date"][:10]
                         fixture_id = f["fixture"]["id"]
+                        home_name = f["teams"]["home"]["name"]
+                        away_name = f["teams"]["away"]["name"]
+
+                        # Determine winner clearly to avoid AI confusion
+                        if h_score is not None and a_score is not None:
+                            if h_score > a_score:
+                                winner_line = f"Result: {home_name} WON {h_score}-{a_score} against {away_name}"
+                            elif a_score > h_score:
+                                winner_line = f"Result: {away_name} WON {a_score}-{h_score} against {home_name}"
+                            else:
+                                winner_line = f"Result: DRAW {h_score}-{h_score} between {home_name} and {away_name}"
+                        else:
+                            winner_line = "Result: Match not yet played"
 
                         match_info = [
-                            f"Match: {f['teams']['home']['name']} vs {f['teams']['away']['name']}",
-                            f"Score: {h_score} - {a_score}" if h_score is not None else "Score: Not yet played",
+                            f"Match: {home_name} (Home) vs {away_name} (Away)",
+                            f"Home Score: {h_score} | Away Score: {a_score}" if h_score is not None else "Score: Not yet played",
+                            winner_line,
                             f"Status: {status}",
                             f"Date: {date}",
                             f"League: {f['league']['name']}",
@@ -717,7 +733,7 @@ async def fetch_football_data(topic: str) -> str:
 
                         relevant.append("\n".join(match_info))
 
-                        # Save fixture ID for player stats fetch (most recent match)
+                        # Save fixture ID for player stats (most recent finished match)
                         if h_score is not None and best_fixture_id is None:
                             best_fixture_id = fixture_id
 
@@ -924,16 +940,15 @@ async def generate_article(topic: str, category: str, real_data: str = "", is_ev
     if category == "football":
         extra_instructions = (
             "\nFOOTBALL RULES:"
-            "\n- SCORES RULE: Use ONLY the score from 'AUTHORITATIVE MATCH DATA' section. NEVER use a score from news context or Tavily results."
-            "\n- If no AUTHORITATIVE MATCH DATA score exists, do NOT write any scoreline — write a preview or general article instead"
-            "\n- If real data shows a COMPLETED match: write PAST TENSE, exact scoreline, goalscorers with minutes, player ratings 1-10"
-            "\n- If real data shows an UPCOMING match: write FUTURE TENSE preview, team form, key players, prediction"
-            "\n- NEVER describe a completed match as upcoming or vice versa"
-            "\n- Write a descriptive headline e.g. 'Mbappé Hat-Trick Fires France Past Nigeria 3-0' not just 'France vs Nigeria'"
-            "\n- For player topics: the 'WHY THIS IS TRENDING' section is your main story angle — write about that specific reason"
-            "\n- Use 'PLAYER SEASON STATS' as supporting data to enrich the article — include key numbers naturally in the text"
-            "\n- Example: if trending because of transfer, write transfer article and include his stats as 'here is what the buying club is getting'"
-            "\n- Always include a Nigerian angle: Super Eagles fans' view, Nigerian players involved, or what it means for Nigerian football"
+            "\n- SCORES RULE: Use ONLY the score from 'AUTHORITATIVE MATCH DATA' section. NEVER use a score from news context."
+            "\n- WINNER RULE: The data clearly states which team WON. Use that exactly — do not swap home and away teams"
+            "\n- If no AUTHORITATIVE MATCH DATA score exists, do NOT write any scoreline — write a preview instead"
+            "\n- COMPLETED match: write PAST TENSE, exact scoreline, goalscorers with minutes, player ratings 1-10"
+            "\n- UPCOMING match: write FUTURE TENSE preview, team form, key players, prediction"
+            "\n- TRANSFER RULE: Any transfer, departure, or signing not officially confirmed must use 'reportedly' or 'according to reports' — NEVER state as fact"
+            "\n- Write a descriptive headline e.g. 'South Africa Stun Japan 1-0 in Historic Win' not just 'Japan vs South Africa'"
+            "\n- For player topics: use 'WHY THIS IS TRENDING' as the main story angle, stats as supporting data"
+            "\n- Always include a Nigerian angle where relevant"
         )
     elif category == "finance":
         extra_instructions = (
