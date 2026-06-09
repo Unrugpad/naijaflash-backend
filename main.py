@@ -56,7 +56,14 @@ FINANCE_KEYWORDS = [
     "invest","investment","stock","shares","nse","dangote","flutterwave","paystack",
     "gtbank","access bank","zenith","uba","fidelity bank","interest rate","loan","mortgage",
     "forex","money","fund","budget","economy","gdp","recession","salary","wage","tax",
-    "pension","saving","opay","palmpay","kuda","piggyvest","cowrywise"
+    "pension","saving","opay","palmpay","kuda","piggyvest","cowrywise",
+    # Nigerian listed companies and energy sector
+    "seplat","mtn nigeria","airtel africa","nnpc","oando","total energies",
+    "lafarge","nestle nigeria","guinness nigeria","cadbury nigeria","unilever nigeria",
+    "stanbic ibtc","first bank","wema bank","sterling bank","jaiz bank","ecobank",
+    "dividend","share price","stock market","ngx","securities exchange","market cap",
+    "oil price","crude oil","barrel","petroleum","refinery","nnpcl","nlng",
+    "bonds","treasury bills","mutual fund","etf","portfolio","capital market"
 ]
 
 ENTERTAINMENT_KEYWORDS = [
@@ -98,7 +105,16 @@ NEWS_KEYWORDS = [
     "attack","bandits","boko haram","ipob","protest","strike","riot","government",
     "minister","commissioner","policy","law","bill","election","vote","inec","tribunal",
     "budget","subsidy","fuel","petrol","electricity","power","tariff","tax","customs",
-    "immigration","visa","passport","foreign affairs","united nations","african union"
+    "immigration","visa","passport","foreign affairs","united nations","african union",
+    # Nigerian states, cities, politicians
+    "kwankwaso","obiano","okowa","makinde","sanwoolu","ganduje","zulum","fayemi",
+    "abuja","kano","ibadan","port harcourt","kaduna","enugu","benin city",
+    "uyo","calabar","warri","owerri","abeokuta","maiduguri","sokoto","yola",
+    "anambra","imo","delta","rivers","bayelsa","edo","ogun","oyo","osun","ekiti",
+    "kwara","kogi","benue","plateau","nassarawa","taraba","adamawa","bauchi",
+    "gombe","yobe","borno","zamfara","kebbi","katsina","jigawa",
+    "senate president","speaker","chief justice","attorney general","minister of",
+    "national assembly","presidency","aso rock","state house","federal government"
 ]
 
 CAT_KEYWORD_MAP = {
@@ -329,63 +345,100 @@ def classify_topic(topic: str) -> Optional[str]:
 
     return best_cat
 
-# ── GOOGLE TRENDS RSS ──
+# ── GOOGLE TRENDS ──
 async def fetch_nigeria_trends() -> List[dict]:
     """
-    Fetch trending topics in Nigeria from Google Trends RSS.
-    Only returns topics from last 24 hours, correctly classified.
+    Fetch trending topics in Nigeria.
+    Tries RSS feed + JSON API for broader coverage.
     """
     trends = []
     skipped = []
+    seen_topics = set()
+
+    async def process_topic(topic: str, pub_text: str = ""):
+        """Process a single topic — classify and add if valid."""
+        if topic in seen_topics:
+            return
+        seen_topics.add(topic)
+
+        # Recency filter
+        if pub_text:
+            try:
+                pub_dt = parsedate_to_datetime(pub_text)
+                now = datetime.now(timezone.utc)
+                age_hours = (now - pub_dt).total_seconds() / 3600
+                if age_hours > 24:
+                    skipped.append(f"OLD({age_hours:.0f}h): {topic}")
+                    return
+            except Exception:
+                pass
+
+        cat = classify_topic(topic)
+        if cat is None:
+            skipped.append(f"UNCLASSIFIED: {topic}")
+            return
+
+        trends.append({"topic": topic, "category": cat})
 
     try:
         async with httpx.AsyncClient(timeout=15) as client:
+            # ── RSS Feed (primary) ──
             r = await client.get(
                 "https://trends.google.com/trending/rss?geo=NG",
                 headers={"User-Agent": "Mozilla/5.0 (compatible; NaijaFlash/1.0)"}
             )
-            if r.status_code != 200:
-                logger.error(f"Google Trends returned {r.status_code}")
-                return []
+            if r.status_code == 200:
+                root = ET.fromstring(r.text)
+                items = root.findall(".//item")
+                for item in items:
+                    title_el = item.find("title")
+                    pubdate_el = item.find("pubDate")
+                    if title_el is not None and title_el.text:
+                        pub_text = pubdate_el.text if pubdate_el is not None else ""
+                        await process_topic(title_el.text.strip(), pub_text)
 
-            root = ET.fromstring(r.text)
-            items = root.findall(".//item")
-            now = datetime.now(timezone.utc)
+                        # Also check ht:approx_traffic for related queries
+                        # Extract related queries from description
+                        desc_el = item.find("description")
+                        if desc_el is not None and desc_el.text:
+                            # Sometimes related searches are in description
+                            desc = desc_el.text.strip()
+                            if len(desc) > 3 and desc != title_el.text.strip():
+                                await process_topic(desc[:100], pub_text)
 
-            for item in items:
-                title_el = item.find("title")
-                pubdate_el = item.find("pubDate")
-
-                if title_el is None or not title_el.text:
-                    continue
-
-                topic = title_el.text.strip()
-
-                # Recency filter — skip if older than 24 hours
-                if pubdate_el is not None and pubdate_el.text:
-                    try:
-                        pub_dt = parsedate_to_datetime(pubdate_el.text)
-                        age_hours = (now - pub_dt).total_seconds() / 3600
-                        if age_hours > 24:
-                            skipped.append(f"OLD({age_hours:.0f}h): {topic}")
-                            continue
-                    except Exception:
-                        pass  # If we can't parse date, allow it through
-
-                # Category classification
-                cat = classify_topic(topic)
-                if cat is None:
-                    skipped.append(f"UNCLASSIFIED: {topic}")
-                    continue
-
-                trends.append({"topic": topic, "category": cat})
-
-            logger.info(f"Google Trends Nigeria: {len(trends)} valid, {len(skipped)} skipped")
-            if skipped:
-                logger.info(f"Skipped: {skipped[:10]}")
+            # ── JSON API (fallback for more topics) ──
+            try:
+                r2 = await client.get(
+                    "https://trends.google.com/trends/api/dailytrends",
+                    params={"hl": "en-NG", "tz": "-60", "geo": "NG", "ns": "15"},
+                    headers={"User-Agent": "Mozilla/5.0 (compatible; NaijaFlash/1.0)"}
+                )
+                if r2.status_code == 200:
+                    # Remove the ")]}'" prefix Google adds
+                    text = r2.text
+                    if text.startswith(")]}'"):
+                        text = text[5:]
+                    data = json.loads(text)
+                    trending_stories = data.get("default", {}).get("trendingSearchesDays", [])
+                    for day in trending_stories[:1]:  # Today only
+                        for story in day.get("trendingSearches", []):
+                            title = story.get("title", {}).get("query", "")
+                            if title:
+                                await process_topic(title)
+                            # Also process related queries
+                            for related in story.get("relatedQueries", [])[:2]:
+                                q = related.get("query", "")
+                                if q:
+                                    await process_topic(q)
+            except Exception as e:
+                logger.info(f"Google Trends JSON API failed (using RSS only): {e}")
 
     except Exception as e:
-        logger.error(f"Google Trends RSS error: {e}")
+        logger.error(f"Google Trends error: {e}")
+
+    logger.info(f"Google Trends Nigeria: {len(trends)} valid, {len(skipped)} skipped")
+    if skipped:
+        logger.info(f"Skipped: {skipped[:10]}")
 
     return trends
 
@@ -645,19 +698,95 @@ async def fetch_match_player_stats(fixture_id: int) -> str:
         logger.error(f"Match player stats error: {e}")
     return ""
 
+async def fetch_head_to_head(team1_id: int, team2_id: int) -> str:
+    """Fetch accurate head-to-head record between two teams."""
+    if not API_FOOTBALL_KEY:
+        return ""
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            r = await client.get(
+                "https://v3.football.api-sports.io/fixtures/headtohead",
+                params={"h2h": f"{team1_id}-{team2_id}", "last": 10},
+                headers={"x-apisports-key": API_FOOTBALL_KEY}
+            )
+            if r.status_code == 200:
+                fixtures = r.json().get("response", [])
+                if not fixtures:
+                    return ""
+                t1_wins = t2_wins = draws = 0
+                lines = []
+                for f in fixtures[:5]:
+                    home = f["teams"]["home"]["name"]
+                    away = f["teams"]["away"]["name"]
+                    h_sc = f["goals"]["home"]
+                    a_sc = f["goals"]["away"]
+                    date = f["fixture"]["date"][:10]
+                    if h_sc is not None and a_sc is not None:
+                        if h_sc > a_sc:
+                            res = f"{home} won"; t1_wins += (1 if f["teams"]["home"]["id"]==team1_id else 0); t2_wins += (1 if f["teams"]["home"]["id"]==team2_id else 0)
+                        elif a_sc > h_sc:
+                            res = f"{away} won"; t1_wins += (1 if f["teams"]["away"]["id"]==team1_id else 0); t2_wins += (1 if f["teams"]["away"]["id"]==team2_id else 0)
+                        else:
+                            res = "Draw"; draws += 1
+                        lines.append(f"  {date}: {home} {h_sc}-{a_sc} {away} ({res})")
+                summary = f"Head-to-Head (last {len(lines)} meetings):\n" + "\n".join(lines)
+                return summary
+    except Exception as e:
+        logger.error(f"H2H error: {e}")
+    return ""
+
+async def fetch_team_form(team_id: int, team_name: str) -> str:
+    """Fetch last 5 match results for a team — for pre-match previews."""
+    if not API_FOOTBALL_KEY:
+        return ""
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            r = await client.get(
+                "https://v3.football.api-sports.io/fixtures",
+                params={"team": team_id, "last": 5, "timezone": "Africa/Lagos"},
+                headers={"x-apisports-key": API_FOOTBALL_KEY}
+            )
+            if r.status_code == 200:
+                fixtures = r.json().get("response", [])
+                if not fixtures:
+                    return ""
+                form_str = ""
+                result_lines = []
+                for f in fixtures:
+                    home_id = f["teams"]["home"]["id"]
+                    h_sc = f["goals"]["home"]
+                    a_sc = f["goals"]["away"]
+                    if h_sc is not None and a_sc is not None:
+                        is_home = home_id == team_id
+                        my_score = h_sc if is_home else a_sc
+                        opp_score = a_sc if is_home else h_sc
+                        opponent = f["teams"]["away"]["name"] if is_home else f["teams"]["home"]["name"]
+                        if my_score > opp_score:
+                            form_str += "W"; result_lines.append(f"  W {my_score}-{opp_score} vs {opponent}")
+                        elif my_score < opp_score:
+                            form_str += "L"; result_lines.append(f"  L {my_score}-{opp_score} vs {opponent}")
+                        else:
+                            form_str += "D"; result_lines.append(f"  D {my_score}-{opp_score} vs {opponent}")
+                if result_lines:
+                    return f"{team_name} Recent Form: {form_str}\n" + "\n".join(result_lines)
+    except Exception as e:
+        logger.error(f"Team form error: {e}")
+    return ""
+
 async def fetch_football_data(topic: str) -> str:
     """
     Fetch real football data:
-    - For match topics (X vs Y): match result + scorers + player ratings
-    - For player topics: full season stats
+    - UPCOMING match: team form + head-to-head + key players preview
+    - COMPLETED match: result + goalscorers + player ratings
+    - Player/team topic: WHY trending + season stats
     """
     if not API_FOOTBALL_KEY:
         return ""
 
     topic_lower = topic.lower()
-    stopwords = {"versus","match","game","news","latest","today","result","score","update","vs","the","and","for","stats","statistics"}
+    stopwords = {"versus","match","game","news","latest","today","result","score","update",
+                 "vs","the","and","for","stats","statistics","preview","prediction"}
     topic_words = [w for w in re.split(r'\W+', topic_lower) if len(w) >= 3 and w not in stopwords]
-
     is_match_topic = bool(re.search(r'\bvs?\b', topic_lower) or ' v ' in topic_lower)
 
     try:
@@ -665,7 +794,7 @@ async def fetch_football_data(topic: str) -> str:
             # ── MATCH TOPIC ──
             if is_match_topic:
                 results = []
-                for params in [{"last": 15}, {"next": 5}]:
+                for params in [{"last": 15}, {"next": 10}]:
                     r = await client.get(
                         "https://v3.football.api-sports.io/fixtures",
                         params={**params, "timezone": "Africa/Lagos"},
@@ -674,76 +803,108 @@ async def fetch_football_data(topic: str) -> str:
                     if r.status_code == 200:
                         results.extend(r.json().get("response", []))
 
+                # Sort by date desc — most recent first
+                results.sort(key=lambda x: x["fixture"]["date"], reverse=True)
+
                 relevant = []
                 best_fixture_id = None
-                # Sort by date descending — most recent match first
-                results.sort(key=lambda x: x["fixture"]["date"], reverse=True)
+                upcoming_fixture = None
+
                 for f in results:
                     home = f["teams"]["home"]["name"].lower()
                     away = f["teams"]["away"]["name"].lower()
                     league = f["league"]["name"].lower()
                     home_words = home.split()
                     away_words = away.split()
-                    matched = False
-                    for tw in topic_words:
-                        if any(tw in hw for hw in home_words) or any(tw in aw for aw in away_words) or tw in league:
-                            matched = True
-                            break
+                    matched = any(
+                        any(tw in hw for hw in home_words) or
+                        any(tw in aw for aw in away_words) or
+                        tw in league
+                        for tw in topic_words
+                    )
+
                     if matched:
                         h_score = f["goals"]["home"]
                         a_score = f["goals"]["away"]
                         status = f["fixture"]["status"]["long"]
+                        status_short = f["fixture"]["status"]["short"]
                         date = f["fixture"]["date"][:10]
                         fixture_id = f["fixture"]["id"]
                         home_name = f["teams"]["home"]["name"]
                         away_name = f["teams"]["away"]["name"]
+                        home_id = f["teams"]["home"]["id"]
+                        away_id = f["teams"]["away"]["id"]
 
-                        # Determine winner clearly to avoid AI confusion
-                        if h_score is not None and a_score is not None:
-                            if h_score > a_score:
-                                winner_line = f"Result: {home_name} WON {h_score}-{a_score} against {away_name}"
-                            elif a_score > h_score:
-                                winner_line = f"Result: {away_name} WON {a_score}-{h_score} against {home_name}"
-                            else:
-                                winner_line = f"Result: DRAW {h_score}-{h_score} between {home_name} and {away_name}"
+                        is_upcoming = status_short in ["NS","TBD","SUSP","PST"]
+
+                        if is_upcoming:
+                            match_info = [
+                                "UPCOMING MATCH — Write a preview article:",
+                                f"Match: {home_name} vs {away_name}",
+                                f"Date: {date}",
+                                f"Status: {status}",
+                                f"League: {f['league']['name']}",
+                                f"Round: {f['league'].get('round','')}"
+                            ]
+                            relevant.append("\n".join(match_info))
+                            if not upcoming_fixture:
+                                upcoming_fixture = (home_id, away_id, home_name, away_name)
                         else:
-                            winner_line = "Result: Match not yet played"
+                            # Determine winner explicitly
+                            if h_score is not None and a_score is not None:
+                                if h_score > a_score:
+                                    winner_line = f"WINNER: {home_name} won {h_score}-{a_score}"
+                                elif a_score > h_score:
+                                    winner_line = f"WINNER: {away_name} won {a_score}-{h_score}"
+                                else:
+                                    winner_line = f"RESULT: Draw {h_score}-{h_score}"
+                            else:
+                                winner_line = "Score: Not available"
 
-                        match_info = [
-                            f"Match: {home_name} (Home) vs {away_name} (Away)",
-                            f"Home Score: {h_score} | Away Score: {a_score}" if h_score is not None else "Score: Not yet played",
-                            winner_line,
-                            f"Status: {status}",
-                            f"Date: {date}",
-                            f"League: {f['league']['name']}",
-                            f"Round: {f['league'].get('round','')}"
-                        ]
+                            match_info = [
+                                "COMPLETED MATCH — Write a match report:",
+                                f"Home Team: {home_name} | Away Team: {away_name}",
+                                f"Home Goals: {h_score} | Away Goals: {a_score}",
+                                winner_line,
+                                f"Date: {date}",
+                                f"League: {f['league']['name']}",
+                                f"Round: {f['league'].get('round','')}"
+                            ]
 
-                        # Add goal scorers from events
-                        events = f.get("events", [])
-                        goals = [e for e in events if e.get("type") == "Goal"]
-                        if goals:
-                            goal_lines = []
-                            for g in goals:
-                                scorer = g.get("player",{}).get("name","Unknown")
-                                minute = g.get("time",{}).get("elapsed","?")
-                                team = g.get("team",{}).get("name","")
-                                goal_lines.append(f"{scorer} ({team}) {minute}'")
-                            match_info.append("Goal Scorers: " + ", ".join(goal_lines))
+                            events = f.get("events", [])
+                            goals = [e for e in events if e.get("type") == "Goal"]
+                            if goals:
+                                goal_lines = [
+                                    f"{g.get('player',{}).get('name','?')} ({g.get('team',{}).get('name','?')}) {g.get('time',{}).get('elapsed','?')}'"
+                                    for g in goals
+                                ]
+                                match_info.append("Goalscorers: " + ", ".join(goal_lines))
+                            else:
+                                match_info.append("Goalscorers: Not available from API — do NOT fabricate names")
 
-                        relevant.append("\n".join(match_info))
+                            relevant.append("\n".join(match_info))
+                            if h_score is not None and best_fixture_id is None:
+                                best_fixture_id = fixture_id
 
-                        # Save fixture ID for player stats (most recent finished match)
-                        if h_score is not None and best_fixture_id is None:
-                            best_fixture_id = fixture_id
-
+                result_text = ""
                 if relevant:
                     result_text = "\n\n".join(relevant[:2])
-                    # Also fetch per-player match stats if match is finished
+
                     if best_fixture_id:
+                        # Post-match player ratings
                         player_stats = await fetch_match_player_stats(best_fixture_id)
                         if player_stats:
                             result_text += f"\n\n{player_stats}"
+                    elif upcoming_fixture:
+                        # Pre-match: team form + head to head
+                        h_id, a_id, h_name, a_name = upcoming_fixture
+                        home_form = await fetch_team_form(h_id, h_name)
+                        away_form = await fetch_team_form(a_id, a_name)
+                        h2h = await fetch_head_to_head(h_id, a_id)
+                        for extra in [home_form, away_form, h2h]:
+                            if extra:
+                                result_text += f"\n\n{extra}"
+
                     logger.info(f"API-Football match data fetched for: {topic}")
                     return result_text
 
@@ -940,15 +1101,17 @@ async def generate_article(topic: str, category: str, real_data: str = "", is_ev
     if category == "football":
         extra_instructions = (
             "\nFOOTBALL RULES:"
-            "\n- SCORES RULE: Use ONLY the score from 'AUTHORITATIVE MATCH DATA' section. NEVER use a score from news context."
-            "\n- WINNER RULE: The data clearly states which team WON. Use that exactly — do not swap home and away teams"
-            "\n- If no AUTHORITATIVE MATCH DATA score exists, do NOT write any scoreline — write a preview instead"
-            "\n- COMPLETED match: write PAST TENSE, exact scoreline, goalscorers with minutes, player ratings 1-10"
-            "\n- UPCOMING match: write FUTURE TENSE preview, team form, key players, prediction"
-            "\n- TRANSFER RULE: Any transfer, departure, or signing not officially confirmed must use 'reportedly' or 'according to reports' — NEVER state as fact"
-            "\n- Write a descriptive headline e.g. 'South Africa Stun Japan 1-0 in Historic Win' not just 'Japan vs South Africa'"
-            "\n- For player topics: use 'WHY THIS IS TRENDING' as the main story angle, stats as supporting data"
-            "\n- Always include a Nigerian angle where relevant"
+            "\n- SCORES RULE: Use ONLY the score from 'AUTHORITATIVE MATCH DATA'. NEVER fabricate a scoreline."
+            "\n- WINNER RULE: Data clearly states WINNER — use that exactly, never swap teams"
+            "\n- GOALSCORERS RULE: Only name goalscorers if they appear in the data. If data says 'Not available — do NOT fabricate names', do NOT name any scorers"
+            "\n- COMPLETED MATCH: Write PAST TENSE match report — scoreline, goalscorers (only if in data), player ratings, key moments, Nigerian angle"
+            "\n- UPCOMING MATCH: Write FUTURE TENSE preview — team form (use the W/L/D data provided), head-to-head record, key players to watch, prediction, Nigerian angle"
+            "\n- PRE-MATCH article structure: Introduction → Team Form → Head to Head → Key Players → Prediction → Nigerian Angle"
+            "\n- POST-MATCH article structure: Introduction with result → Match Report → Player Ratings → Key Moments → Nigerian Angle"
+            "\n- TRANSFER RULE: Any unconfirmed transfer must use 'reportedly' or 'according to reports'"
+            "\n- Write a descriptive headline — not just team names. Example: 'Nigeria vs Portugal Preview: Super Eagles Form, H2H & Prediction'"
+            "\n- For player topics: WHY TRENDING is the main story angle, stats are supporting data"
+            "\n- Always include Nigerian angle — Super Eagles, Nigerian players, what it means for Nigerian fans"
         )
     elif category == "finance":
         extra_instructions = (
