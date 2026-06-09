@@ -346,78 +346,132 @@ def classify_topic(topic: str) -> Optional[str]:
     return best_cat
 
 # ── TAVILY TREND DISCOVERY ──
-# Category-specific search queries to discover trending Nigerian topics
+# More specific queries to get actual news stories, not website homepages
 CATEGORY_TREND_QUERIES = {
-    "football": "Nigeria football news today latest match result",
-    "finance": "Nigeria finance economy naira dollar news today",
-    "entertainment": "Nigeria entertainment music Nollywood celebrity news today",
-    "tech": "Nigeria technology phones gadgets apps news today",
-    "health": "Nigeria health medical news today",
-    "education": "Nigeria education JAMB WAEC school news today",
-    "news": "Nigeria breaking news politics government today",
+    "football": [
+        "Super Eagles Nigeria football match result June 2026",
+        "Premier League Champions League match result today",
+        "Africa Cup Nations World Cup football Nigeria player news",
+    ],
+    "finance": [
+        "naira dollar exchange rate black market CBN today 2026",
+        "Nigeria economy inflation CBN interest rate news June 2026",
+        "bitcoin crypto USDT naira price Nigeria today",
+    ],
+    "entertainment": [
+        "Davido Burna Boy Wizkid Asake new song album 2026",
+        "Nollywood movie award celebrity Nigeria entertainment news",
+        "BBNaija Afrobeats Nigerian music concert tour 2026",
+    ],
+    "tech": [
+        "smartphone phone price Nigeria Tecno Samsung iPhone 2026",
+        "Nigeria tech startup internet data plan MTN Airtel 2026",
+        "Nigeria technology innovation app launch news June 2026",
+    ],
+    "health": [
+        "Nigeria disease outbreak NCDC health alert June 2026",
+        "Nigeria hospital health ministry doctor medical news 2026",
+        "malaria typhoid cholera Lassa fever Nigeria treatment 2026",
+    ],
+    "education": [
+        "JAMB UTME Post-UTME result 2026 university admission Nigeria",
+        "WAEC NECO result timetable exam 2026 Nigeria students",
+        "Nigeria scholarship university admission NYSC update 2026",
+    ],
+    "news": [
+        "Tinubu government policy Nigeria news June 2026",
+        "Nigeria senate court EFCC police army attack news today",
+        "Nigeria state governor politics election news June 2026",
+    ],
 }
 
 # ── WEBSITE NAME DETECTION ──
 WEBSITE_NAME_PATTERNS = [
     r'(\.ng|\.com|\.org|\.net)\s*[-–|]',
-    r'[-–|]\s*(news|gist|blog|updates|latest|today|ng|media|online|tv|fm)$',
-    r'^(myschool|legit|vanguard|punch|guardian|thisday|channels|arise|sahara)',
-    r'(nairaland|naijaloaded|linda ikeji|bellanaija|pulse\.ng|nairametrics)',
-    r'^(google news|yahoo news|bing news|breaking news|latest news)',
+    r'[-–|]\s*(news|gist|blog|updates|latest|today|ng|media|online|tv|fm|wire|post|nigeria)$',
+    r'^(myschool|soccernet|owngoal|nff official|legit\.ng|vanguard|punch|guardian|thisday|channels|arise|sahara)',
+    r'(nairaland|naijaloaded|linda ikeji|bellanaija|pulse\.ng|nairametrics|premiumtimes)',
+    r'^(google news|yahoo news|bing news|breaking news|latest news|top stories)',
     r'(schools and exams news|celebrity gist|breaking news, latest stories)',
-    r'^\w[\w\s]{2,20}\s*[-–|:]\s*(news|updates|gist|latest|today|ng)$',
+    r'(nigeria football news|nigerian football|all nigeria soccer)',
+    r'^\w[\w\s]{2,25}\s*[-–|:]\s*(news|updates|gist|latest|today|ng|nigeria)$',
     r'(the world\'s no\.|#\d+ source|no\. ?1 source)',
     r'(archives?|category|tag|page \d|section)\s*$',
-    r'^(nigeria|nigerian)\s+(politics|finance|health|education|entertainment|tech|sports)\s+news\s*[|\-–]',
+    r'^(nigeria|nigerian)\s+(politics|finance|health|education|entertainment|tech|sports|football)\s+news',
     r'(state house|aso rock|presidency)\s*,?\s*abuja\s*$',
+    r'^headline stories?\s*[·•\-–]',
+    r';\s*(the punch|vanguard|channels|guardian|thisday|daily post|leadership|thisday)',
+    r'latest\s*;\s*\w',
+    r'^\d+:\d+\s+(mon|tue|wed|thu|fri|sat|sun)',
+    r'\|\s*latest and breaking',
+    r'news in nigeria\s*[-–|]',
+    r'^(phone apps|mobile phones|smartphones)\s*\|',
+    r'(entertainment today|entertainment news)\s*\|',
+    r'^(nff official website|the nigeria football federation)',
+    # Long messy strings with semicolons/bullets = RSS feed snippets
+    r'.{30,}[;·•].{10,}[;·•]',
+    # Strings that start with a news item then add more — likely aggregator
+    r'\w+\s+\d+:\d+\s+(mon|tue|wed|thu|fri|sat|sun)',
 ]
 
 def is_website_name(title: str) -> bool:
     t = title.lower().strip()
+    # Too long — likely a multi-story RSS snippet not a headline
+    if len(t) > 200:
+        return True
     for pattern in WEBSITE_NAME_PATTERNS:
         if re.search(pattern, t):
             return True
     words = t.split()
-    generic = {"news","latest","updates","gist","today","breaking","stories","headlines"}
-    if len(words) <= 4 and len(set(words) - generic) <= 2:
+    generic = {"news","latest","updates","gist","today","breaking","stories","headlines","nigeria","nigerian"}
+    if len(words) <= 4 and len(set(words) - generic) <= 1:
         return True
     return False
 
 def extract_best_headline(page_title: str, content: str, category: str) -> Optional[str]:
-    """Extract the best news headline from a Tavily result."""
+    """Extract the best real news headline from a Tavily result."""
 
-    # Try page title first if it looks like a real headline
-    if page_title and not is_website_name(page_title):
-        # Clean source name from end: "Title - Source Name" -> "Title"
-        clean = re.sub(r'\s*[-–|]\s*[A-Z][A-Za-z\s\.]{2,30}$', '', page_title).strip()
+    # Try page title first — only if it's a real headline
+    if page_title and not is_website_name(page_title) and len(page_title) > 20:
+        # Remove source suffix: "Kebbi Extends Retirement Age - Daily Post Nigeria" -> "Kebbi Extends..."
+        clean = re.sub(r'\s*[-–|]\s*[A-Z][A-Za-z\s\.&]{2,35}$', '', page_title).strip()
         clean = re.sub(r'^\d{1,2}[\/\-]\d{1,2}[\/\-]\d{2,4}\s*[-–]\s*', '', clean).strip()
-        if len(clean) >= 25 and not is_website_name(clean):
-            return clean
+        # Remove "·" and everything after (common in RSS aggregators)
+        clean = re.sub(r'\s*[·•]\s*.+$', '', clean).strip()
+        if len(clean) >= 20 and not is_website_name(clean):
+            return clean[:150]
 
-    # Extract from content — find sentence that reads like news
+    # Extract from content — find first sentence that reads like a news story
     if not content:
         return None
 
-    sentences = re.split(r'(?<=[.!?])\s+|\n', content)
+    # Split on sentence boundaries and newlines
+    sentences = re.split(r'(?<=[.!?])\s+|\n+', content)
     news_words = {
         'announce','reveal','confirm','launch','release','approve','win','lose',
-        'beat','score','sign','hire','fire','arrest','accuse','deny','warn',
-        'hit','rise','fall','drop','increase','reach','naira','dollar','jamb',
-        'waec','neco','police','court','government','president','minister',
-        'governor','senate','million','billion','₦','$','%','vs','defeat',
-        'victory','draw','qualify','dead','kill','attack','bomb','crash',
-        'flood','outbreak','ban','suspend','resign','appoint','sack','probe'
+        'beat','score','sign','hire','fire','arrest','accuse','deny','warn','urge',
+        'hit','rise','fall','drop','increase','decrease','reach','extend','expand',
+        'naira','dollar','jamb','waec','neco','police','court','government',
+        'president','minister','governor','senate','million','billion','₦','$','%',
+        'vs','defeat','victory','draw','qualify','dead','kill','attack','bomb',
+        'crash','flood','outbreak','ban','suspend','resign','appoint','sack','probe',
+        'approve','reject','pass','sign','bill','law','policy','reform','invest',
     }
 
     for sent in sentences:
         sent = sent.strip()
-        if len(sent) < 25 or len(sent) > 180:
+        # Must be a good length for a headline
+        if len(sent) < 20 or len(sent) > 200:
             continue
         if is_website_name(sent):
             continue
         sent_lower = sent.lower()
+        # Must contain at least one news action word
         if sum(1 for w in news_words if w in sent_lower) >= 1:
-            return sent[:150]
+            # Clean it up
+            result = re.sub(r'\s*[-–|]\s*[A-Z][A-Za-z\s\.&]{2,35}$', '', sent).strip()
+            if len(result) >= 20:
+                return result[:150]
 
     return None
 
@@ -442,72 +496,70 @@ def deduplicate_topics(topics: List[dict]) -> List[dict]:
 
     return unique
 
-async def fetch_topics_from_tavily(category: str, query: str) -> List[dict]:
+async def fetch_topics_from_tavily(category: str, queries) -> List[dict]:
     """
     Discover real trending topics using Tavily.
+    Accepts single query string or list of queries.
     Extracts actual news headlines from content — not website page titles.
     """
     if not TAVILY_API_KEY:
         return []
+
+    query_list = [queries] if isinstance(queries, str) else queries[:2]
     topics = []
     seen = set()
 
-    try:
-        async with httpx.AsyncClient(timeout=15) as client:
-            r = await client.post(
-                "https://api.tavily.com/search",
-                json={
-                    "api_key": TAVILY_API_KEY,
-                    "query": query,
-                    "search_depth": "basic",
-                    "max_results": 8,
-                    "include_answer": False,
-                    "sort_by": "date",
-                }
-            )
-            if r.status_code != 200:
-                return []
-
-            results = r.json().get("results", [])
-
-            for res in results:
-                page_title = res.get("title", "").strip()
-                content = res.get("content", "").strip()
-                url = res.get("url", "")
-
-                # Skip aggregator/index pages
-                skip_domains = ["google.com","bing.com","yahoo.com","reddit.com",
-                                "wikipedia.org","facebook.com","twitter.com","x.com",
-                                "youtube.com","instagram.com"]
-                if any(d in url for d in skip_domains):
+    for query in query_list:
+        try:
+            async with httpx.AsyncClient(timeout=15) as client:
+                r = await client.post(
+                    "https://api.tavily.com/search",
+                    json={
+                        "api_key": TAVILY_API_KEY,
+                        "query": query,
+                        "search_depth": "basic",
+                        "max_results": 6,
+                        "include_answer": False,
+                        "sort_by": "date",
+                    }
+                )
+                if r.status_code != 200:
                     continue
 
-                # Extract best headline
-                headline = extract_best_headline(page_title, content, category)
-                if not headline:
-                    continue
+                for res in r.json().get("results", []):
+                    page_title = res.get("title", "").strip()
+                    content = res.get("content", "").strip()
+                    url = res.get("url", "")
 
-                h_lower = headline.lower()
-                if h_lower in seen:
-                    continue
-                seen.add(h_lower)
+                    skip_domains = ["google.com","bing.com","yahoo.com","reddit.com",
+                                    "wikipedia.org","facebook.com","twitter.com","x.com",
+                                    "youtube.com","instagram.com","tiktok.com"]
+                    if any(d in url for d in skip_domains):
+                        continue
 
-                # Classify
-                detected_cat = classify_topic(headline)
-                final_cat = detected_cat if detected_cat else category
+                    headline = extract_best_headline(page_title, content, category)
+                    if not headline:
+                        continue
 
-                topics.append({
-                    "topic": headline,
-                    "category": final_cat,
-                    "source": "tavily_discovery",
-                    "context": content[:600]
-                })
+                    h_lower = headline.lower()
+                    if h_lower in seen:
+                        continue
+                    seen.add(h_lower)
 
-        logger.info(f"Tavily [{category}]: {len(topics)} real headlines extracted")
+                    detected_cat = classify_topic(headline)
+                    final_cat = detected_cat if detected_cat else category
 
-    except Exception as e:
-        logger.error(f"Tavily discovery error [{category}]: {e}")
+                    topics.append({
+                        "topic": headline,
+                        "category": final_cat,
+                        "source": "tavily_discovery",
+                        "context": content[:600]
+                    })
 
+        except Exception as e:
+            logger.error(f"Tavily error [{category}] '{query[:30]}': {e}")
+
+    logger.info(f"Tavily [{category}]: {len(topics)} headlines from {len(query_list)} queries")
     return topics
 
 async def fetch_nigeria_trends() -> List[dict]:
@@ -1249,7 +1301,19 @@ async def generate_article(topic: str, category: str, real_data: str = "", is_ev
             "\n- Write a descriptive headline — not just team names. Example: 'Nigeria vs Portugal Preview: Super Eagles Form, H2H & Prediction'"
             "\n- For player topics: WHY TRENDING is the main story angle, stats are supporting data"
             "\n- Always include Nigerian angle — Super Eagles, Nigerian players, what it means for Nigerian fans"
-            "\n- FUTURE MATCH RULE: The 2026 FIFA World Cup starts June 11, 2026. NEVER write a result for any World Cup match unless the data explicitly shows it has been completed with a score. If no completed match data exists, write a preview only."
+            "\n- VENUE RULE: Always use the exact venue from the data — never guess or substitute a different city"
+            "\n- OPPONENT RULE: Use the exact team name from data — 'Northern Ireland' and 'Republic of Ireland' are different teams"
+            "\n- FUTURE MATCH RULE: The 2026 FIFA World Cup starts June 11, 2026. NEVER write a result for any World Cup match unless data confirms it has been played"
+        )
+    elif category == "tech":
+        extra_instructions = (
+            "\nTECH RULES:"
+            "\n- PHONE PRICES: Always give price RANGES in NGN, never a single figure"
+            "\n- iPhone 18 has NOT been released yet (expected October 2026) — never give an iPhone 18 price"
+            "\n- Current iPhone prices in Nigeria (June 2026): iPhone 16e ~₦326,250, iPhone 17 ~₦359,550, iPhone 17 Pro Max ~₦539,550"
+            "\n- Never say 'official price' for phones — Apple doesn't publish NGN prices. Say 'current market price'"
+            "\n- Tecno, Infinix, Itel prices are much lower (₦80,000–₦300,000 range)"
+            "\n- Always mention where to buy: Slot, Jumia, Konga, Computer Village"
         )
     elif category == "finance":
         extra_instructions = (
@@ -1258,6 +1322,15 @@ async def generate_article(topic: str, category: str, real_data: str = "", is_ev
             "\n- If no live rate is provided, say 'rates vary — check your exchange platform'"
             "\n- Explain what the rate means for Nigerians practically"
             "\n- Never state a specific naira rate as fact unless it appears in the real data provided"
+        )
+    elif category == "tech":
+        extra_instructions = (
+            "\nTECH RULES:"
+            "\n- iPhone 18 has NOT been released yet — expected October 2026. Never state an iPhone 18 price as fact"
+            "\n- Current iPhone prices in Nigeria (June 2026): iPhone 16e from ₦326,250, iPhone 17 from ₦359,550, iPhone 17 Pro Max from ₦539,550"
+            "\n- Never state any phone price below ₦100,000 for a new iPhone — minimum real price is ₦300,000+"
+            "\n- Always present phone prices as ranges and note they vary by retailer and exchange rate"
+            "\n- For unreleased phones: say 'expected to launch' and 'estimated price' — never state as confirmed"
         )
     elif category == "health":
         extra_instructions = (
