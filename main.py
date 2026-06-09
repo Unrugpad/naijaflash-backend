@@ -345,44 +345,93 @@ def classify_topic(topic: str) -> Optional[str]:
 
     return best_cat
 
-# ── GOOGLE TRENDS ──
-async def fetch_nigeria_trends() -> List[dict]:
-    """
-    Fetch trending topics in Nigeria.
-    Tries RSS feed + JSON API for broader coverage.
-    """
-    trends = []
-    skipped = []
-    seen_topics = set()
+# ── TAVILY TREND DISCOVERY ──
+# Category-specific search queries to discover trending Nigerian topics
+CATEGORY_TREND_QUERIES = {
+    "football": "Nigeria football news today latest match result",
+    "finance": "Nigeria finance economy naira dollar news today",
+    "entertainment": "Nigeria entertainment music Nollywood celebrity news today",
+    "tech": "Nigeria technology phones gadgets apps news today",
+    "health": "Nigeria health medical news today",
+    "education": "Nigeria education JAMB WAEC school news today",
+    "news": "Nigeria breaking news politics government today",
+}
 
-    async def process_topic(topic: str, pub_text: str = ""):
-        """Process a single topic — classify and add if valid."""
-        if topic in seen_topics:
-            return
-        seen_topics.add(topic)
-
-        # Recency filter
-        if pub_text:
-            try:
-                pub_dt = parsedate_to_datetime(pub_text)
-                now = datetime.now(timezone.utc)
-                age_hours = (now - pub_dt).total_seconds() / 3600
-                if age_hours > 24:
-                    skipped.append(f"OLD({age_hours:.0f}h): {topic}")
-                    return
-            except Exception:
-                pass
-
-        cat = classify_topic(topic)
-        if cat is None:
-            skipped.append(f"UNCLASSIFIED: {topic}")
-            return
-
-        trends.append({"topic": topic, "category": cat})
-
+async def fetch_topics_from_tavily(category: str, query: str) -> List[dict]:
+    """Use Tavily to discover trending topics for a specific category."""
+    if not TAVILY_API_KEY:
+        return []
+    topics = []
+    seen = set()
     try:
         async with httpx.AsyncClient(timeout=15) as client:
-            # ── RSS Feed (primary) ──
+            r = await client.post(
+                "https://api.tavily.com/search",
+                json={
+                    "api_key": TAVILY_API_KEY,
+                    "query": query,
+                    "search_depth": "basic",
+                    "max_results": 7,
+                    "include_answer": False,
+                    "sort_by": "date",
+                }
+            )
+            if r.status_code == 200:
+                results = r.json().get("results", [])
+                for res in results:
+                    title = res.get("title", "").strip()
+                    # Clean up title — remove source names and dates
+                    title = re.sub(r'\s*[-–|]\s*\w+[\w\s]*$', '', title).strip()
+                    title = re.sub(r'^\d{1,2}/\d{1,2}/\d{4}\s*[-–]\s*', '', title).strip()
+                    if len(title) < 10 or title in seen:
+                        continue
+                    seen.add(title)
+                    # Verify it matches the intended category
+                    detected_cat = classify_topic(title)
+                    final_cat = detected_cat if detected_cat else category
+                    topics.append({
+                        "topic": title,
+                        "category": final_cat,
+                        "source": "tavily_discovery"
+                    })
+        logger.info(f"Tavily discovery [{category}]: {len(topics)} topics")
+    except Exception as e:
+        logger.error(f"Tavily discovery error [{category}]: {e}")
+    return topics
+
+async def fetch_nigeria_trends() -> List[dict]:
+    """
+    Discover trending Nigerian topics using Tavily.
+    Searches across all 7 categories to get diverse, real Nigerian news.
+    Also tries Google Trends RSS as a bonus source.
+    """
+    all_topics = []
+    seen_topics = set()
+
+    def add_topic(topic: str, category: str, source: str = "tavily"):
+        t = topic.strip()
+        t_lower = t.lower()
+        if t_lower in seen_topics or len(t) < 8:
+            return
+        seen_topics.add(t_lower)
+        all_topics.append({"topic": t, "category": category, "source": source})
+
+    # ── Primary: Tavily searches across all categories ──
+    # Run all category searches concurrently
+    tasks = [
+        fetch_topics_from_tavily(cat, query)
+        for cat, query in CATEGORY_TREND_QUERIES.items()
+    ]
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+
+    for cat_topics in results:
+        if isinstance(cat_topics, list):
+            for t in cat_topics:
+                add_topic(t["topic"], t["category"], "tavily_discovery")
+
+    # ── Bonus: Google Trends RSS (if it works) ──
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
             r = await client.get(
                 "https://trends.google.com/trending/rss?geo=NG",
                 headers={"User-Agent": "Mozilla/5.0 (compatible; NaijaFlash/1.0)"}
@@ -390,57 +439,38 @@ async def fetch_nigeria_trends() -> List[dict]:
             if r.status_code == 200:
                 root = ET.fromstring(r.text)
                 items = root.findall(".//item")
+                now = datetime.now(timezone.utc)
                 for item in items:
                     title_el = item.find("title")
                     pubdate_el = item.find("pubDate")
-                    if title_el is not None and title_el.text:
-                        pub_text = pubdate_el.text if pubdate_el is not None else ""
-                        await process_topic(title_el.text.strip(), pub_text)
-
-                        # Also check ht:approx_traffic for related queries
-                        # Extract related queries from description
-                        desc_el = item.find("description")
-                        if desc_el is not None and desc_el.text:
-                            # Sometimes related searches are in description
-                            desc = desc_el.text.strip()
-                            if len(desc) > 3 and desc != title_el.text.strip():
-                                await process_topic(desc[:100], pub_text)
-
-            # ── JSON API (fallback for more topics) ──
-            try:
-                r2 = await client.get(
-                    "https://trends.google.com/trends/api/dailytrends",
-                    params={"hl": "en-NG", "tz": "-60", "geo": "NG", "ns": "15"},
-                    headers={"User-Agent": "Mozilla/5.0 (compatible; NaijaFlash/1.0)"}
-                )
-                if r2.status_code == 200:
-                    # Remove the ")]}'" prefix Google adds
-                    text = r2.text
-                    if text.startswith(")]}'"):
-                        text = text[5:]
-                    data = json.loads(text)
-                    trending_stories = data.get("default", {}).get("trendingSearchesDays", [])
-                    for day in trending_stories[:1]:  # Today only
-                        for story in day.get("trendingSearches", []):
-                            title = story.get("title", {}).get("query", "")
-                            if title:
-                                await process_topic(title)
-                            # Also process related queries
-                            for related in story.get("relatedQueries", [])[:2]:
-                                q = related.get("query", "")
-                                if q:
-                                    await process_topic(q)
-            except Exception as e:
-                logger.info(f"Google Trends JSON API failed (using RSS only): {e}")
-
+                    if title_el is None or not title_el.text:
+                        continue
+                    topic = title_el.text.strip()
+                    # Recency check
+                    if pubdate_el is not None and pubdate_el.text:
+                        try:
+                            pub_dt = parsedate_to_datetime(pubdate_el.text)
+                            age_hours = (now - pub_dt).total_seconds() / 3600
+                            if age_hours > 24:
+                                continue
+                        except Exception:
+                            pass
+                    cat = classify_topic(topic)
+                    if cat:
+                        add_topic(topic, cat, "google_trends")
+                logger.info(f"Google Trends RSS bonus: added {len([t for t in all_topics if t.get('source')=='google_trends'])} topics")
     except Exception as e:
-        logger.error(f"Google Trends error: {e}")
+        logger.info(f"Google Trends RSS unavailable (expected on Railway): {e}")
 
-    logger.info(f"Google Trends Nigeria: {len(trends)} valid, {len(skipped)} skipped")
-    if skipped:
-        logger.info(f"Skipped: {skipped[:10]}")
+    logger.info(f"Total trends discovered: {len(all_topics)} across all categories")
 
-    return trends
+    # Log breakdown by category
+    cat_counts = {}
+    for t in all_topics:
+        cat_counts[t["category"]] = cat_counts.get(t["category"], 0) + 1
+    logger.info(f"Category breakdown: {cat_counts}")
+
+    return all_topics
 
 # ── TAVILY SEARCH ──
 
@@ -1112,6 +1142,7 @@ async def generate_article(topic: str, category: str, real_data: str = "", is_ev
             "\n- Write a descriptive headline — not just team names. Example: 'Nigeria vs Portugal Preview: Super Eagles Form, H2H & Prediction'"
             "\n- For player topics: WHY TRENDING is the main story angle, stats are supporting data"
             "\n- Always include Nigerian angle — Super Eagles, Nigerian players, what it means for Nigerian fans"
+            "\n- FUTURE MATCH RULE: The 2026 FIFA World Cup starts June 11, 2026. NEVER write a result for any World Cup match unless the data explicitly shows it has been completed with a score. If no completed match data exists, write a preview only."
         )
     elif category == "finance":
         extra_instructions = (
@@ -1876,13 +1907,30 @@ async def telegram_webhook(request: Request):
                 if not is_admin(user_id):
                     await send_telegram(chat_id, "⛔ Admins only.")
                     return {"ok": True}
-                await send_telegram(chat_id, "🔍 Fetching Nigeria trends...")
+                await send_telegram(chat_id, "🔍 Fetching Nigeria trends across all categories...")
                 trends = await fetch_nigeria_trends()
                 if not trends:
                     await send_telegram(chat_id, "No relevant trends found right now.")
                 else:
-                    lines = "\n".join([f"• [{t['category'].upper()}] {t['topic']}" for t in trends])
-                    await send_telegram(chat_id, f"🇳🇬 <b>Trending in Nigeria Now</b>\n\n{lines}")
+                    # Group by category
+                    by_cat = {}
+                    for t in trends:
+                        cat = t["category"]
+                        if cat not in by_cat:
+                            by_cat[cat] = []
+                        by_cat[cat].append(t["topic"])
+
+                    lines = []
+                    for cat, topics in sorted(by_cat.items()):
+                        lines.append(f"\n<b>{cat.upper()}</b>")
+                        for topic in topics[:3]:
+                            lines.append(f"  • {topic[:60]}")
+
+                    await send_telegram(chat_id,
+                        f"🇳🇬 <b>Trending in Nigeria Now</b>\n"
+                        f"({len(trends)} topics across {len(by_cat)} categories)"
+                        + "\n".join(lines)
+                    )
 
             elif text == "/stats":
                 if not is_admin(user_id):
