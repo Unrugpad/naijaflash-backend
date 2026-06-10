@@ -635,33 +635,38 @@ ALL_CATEGORIES_ORDERED = ["news", "football", "finance", "entertainment", "tech"
 
 def get_categories_for_run() -> List[str]:
     """
-    Return 4 categories for this pipeline run.
-    Rotates through all 7 so every category gets covered over 2 runs.
+    Return categories for this pipeline run.
+    Alternates: 4 categories then 3 categories, covering all 7 with no repeats across 2 runs.
+    Run 1: news, football, finance, entertainment (4)
+    Run 2: tech, health, education (3)
+    Run 3: news, football, finance, entertainment (4) again
     """
     try:
         conn = get_db()
         cur = conn.cursor()
-        # Track which categories ran last using tavily_cache with special key
         cur.execute("SELECT result FROM tavily_cache WHERE cache_key='_category_rotation'")
         row = cur.fetchone()
         cur.close()
         conn.close()
-        if row:
-            last_index = int(row["result"])
-        else:
-            last_index = -1
+        last_index = int(row["result"]) if row else -1
     except:
         last_index = -1
 
-    # Pick next 4 categories starting from where we left off
     n = len(ALL_CATEGORIES_ORDERED)
+    # Start from where we left off
     start = (last_index + 1) % n
-    selected = []
-    for i in range(4):
-        selected.append(ALL_CATEGORIES_ORDERED[(start + i) % n])
+    # Determine how many to pick — alternate 4 and 3
+    # If start position allows 4 without wrapping past end of 7, pick 4, else pick 3
+    remaining = n - start
+    batch_size = 4 if remaining >= 4 else remaining
 
-    # Save rotation position
-    set_tavily_cache("_category_rotation", str((start + 3) % n))
+    selected = [ALL_CATEGORIES_ORDERED[(start + i) % n] for i in range(batch_size)]
+
+    # Save next start position
+    next_index = (start + batch_size - 1) % n
+    set_tavily_cache("_category_rotation", str(next_index))
+
+    logger.info(f"Category rotation: {selected} (next starts at {(next_index+1)%n})")
     return selected
 
 async def fetch_topics_from_tavily(category: str, queries) -> List[dict]:
@@ -1750,10 +1755,13 @@ async def send_article_for_approval(article_id: int, title: str, excerpt: str, c
         f"<b>Excerpt:</b>\n{excerpt}\n\n"
         f"<b>ID:</b> #{article_id}"
     )
-    markup = {"inline_keyboard": [[
-        {"text": "✅ Approve", "callback_data": f"approve_{article_id}"},
-        {"text": "❌ Reject", "callback_data": f"reject_{article_id}"}
-    ]]}
+    markup = {"inline_keyboard": [
+        [
+            {"text": "✅ Approve", "callback_data": f"approve_{article_id}"},
+            {"text": "❌ Reject", "callback_data": f"reject_{article_id}"},
+            {"text": "📂 Change Category", "callback_data": f"changecat_{article_id}"}
+        ]
+    ]}
     await send_to_all_admins(text, reply_markup=markup)
 
 # ── TOPIC TRACKING ──
@@ -2368,6 +2376,41 @@ async def telegram_webhook(request: Request):
                 cur.close()
                 conn.close()
                 await send_to_all_admins(f"❌ Article #{article_id} rejected.")
+
+            elif cb_data.startswith("changecat_"):
+                article_id = int(cb_data.split("_")[1])
+                # Show category selection buttons
+                cat_buttons = []
+                cat_emojis = {"football":"⚽","finance":"💰","entertainment":"🎭","tech":"📱","health":"🏥","education":"📚","news":"📰"}
+                row = []
+                for cat in CATEGORIES:
+                    row.append({"text": f"{cat_emojis.get(cat,'')} {cat.capitalize()}", "callback_data": f"setcat_{article_id}_{cat}"})
+                    if len(row) == 3:
+                        cat_buttons.append(row)
+                        row = []
+                if row:
+                    cat_buttons.append(row)
+                await send_telegram(cb["from"]["id"],
+                    f"📂 Choose new category for article #{article_id}:",
+                    reply_markup={"inline_keyboard": cat_buttons}
+                )
+
+            elif cb_data.startswith("setcat_"):
+                parts = cb_data.split("_")
+                article_id = int(parts[1])
+                new_cat = parts[2]
+                conn = get_db()
+                cur = conn.cursor()
+                cur.execute("UPDATE articles SET category=%s WHERE id=%s RETURNING title", (new_cat, article_id))
+                row = cur.fetchone()
+                conn.commit()
+                cur.close()
+                conn.close()
+                if row:
+                    await send_to_all_admins(
+                        f"📂 Article #{article_id} moved to <b>{new_cat.upper()}</b>\n"
+                        f"Title: {row['title'][:60]}"
+                    )
 
             elif cb_data.startswith("pub_sponsored_"):
                 session_chat_id = int(cb_data.split("_")[2])
