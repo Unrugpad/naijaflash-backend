@@ -34,7 +34,7 @@ API_FOOTBALL_KEY = os.getenv("API_FOOTBALL_KEY")
 GNEWS_API_KEY = os.getenv("GNEWS_API_KEY")
 TAVILY_API_KEY = os.getenv("TAVILY_API_KEY")
 
-CATEGORIES = ["entertainment", "finance", "tech", "health", "education", "news", "football"]
+CATEGORIES = ["entertainment", "finance", "tech", "health", "education", "news", "football", "uncategorized"]
 
 # ── KEYWORD SETS ──
 # "vs" pattern handled separately — always football
@@ -717,10 +717,21 @@ async def fetch_topics_from_tavily(category: str, queries) -> List[dict]:
         if cached:
             try:
                 cached_topics = _json.loads(cached)
-                # Re-filter cached results — remove any that slipped through
-                # We can't re-check pub_date from cache so just use them
-                # but skip website names that might have been missed
-                valid = [t for t in cached_topics if not is_website_name(t.get("topic",""))]
+                # Re-filter cached results — check stored pub_date_hours
+                now_ts = datetime.now(timezone.utc).timestamp()
+                valid = []
+                for t in cached_topics:
+                    if is_website_name(t.get("topic","")):
+                        continue
+                    # Check stored age — skip if older than 48 hours from when it was fetched
+                    stored_age = t.get("age_hours_at_fetch", 0)
+                    fetch_ts = t.get("fetched_at", now_ts)
+                    hours_since_fetch = (now_ts - fetch_ts) / 3600
+                    total_age = stored_age + hours_since_fetch
+                    if total_age > 48:
+                        logger.info(f"Skipping stale cached topic ({total_age:.0f}h): {t.get('topic','')[:40]}")
+                        continue
+                    valid.append(t)
                 if valid:
                     topics.extend(valid)
                     logger.info(f"Cache hit [{category}]: {len(valid)} topics")
@@ -745,6 +756,7 @@ async def fetch_topics_from_tavily(category: str, queries) -> List[dict]:
                     continue
 
                 new_topics = []
+                fetch_ts = datetime.now(timezone.utc).timestamp()
                 for res in r.json().get("results", []):
                     page_title = res.get("title", "").strip()
                     content = res.get("content", "").strip()
@@ -752,12 +764,13 @@ async def fetch_topics_from_tavily(category: str, queries) -> List[dict]:
                     pub_date = res.get("published_date", "") or ""
 
                     # 48-hour filter — trending topics must be fresh
+                    age_hours_at_fetch = 0
                     if pub_date:
                         try:
                             pub_dt = datetime.fromisoformat(pub_date.replace("Z", "+00:00"))
-                            age_hours = (datetime.now(timezone.utc) - pub_dt).total_seconds() / 3600
-                            if age_hours > 48:
-                                logger.info(f"Skipping ({age_hours:.0f}h old): {page_title[:40]}")
+                            age_hours_at_fetch = (datetime.now(timezone.utc) - pub_dt).total_seconds() / 3600
+                            if age_hours_at_fetch > 48:
+                                logger.info(f"Skipping ({age_hours_at_fetch:.0f}h old): {page_title[:40]}")
                                 continue
                         except Exception:
                             pass
@@ -785,21 +798,28 @@ async def fetch_topics_from_tavily(category: str, queries) -> List[dict]:
                         continue
                     seen.add(h_lower)
 
+                    # Classify topic — if no match, use "uncategorized" not search category
                     detected_cat = classify_topic(headline)
-                    final_cat = detected_cat if detected_cat else category
-
-                    if final_cat == "football" and category != "football":
-                        if not any(kw in headline.lower() for kw in ["football","soccer","goal","match","premier","league","afcon","fifa","ucl"]):
-                            final_cat = category
+                    if detected_cat:
+                        final_cat = detected_cat
+                        # Prevent football misclassification
+                        if final_cat == "football" and category != "football":
+                            if not any(kw in headline.lower() for kw in ["football","soccer","goal","match","premier","league","afcon","fifa","ucl"]):
+                                final_cat = "uncategorized"
+                    else:
+                        # No category match — mark as uncategorized so admin can assign
+                        final_cat = "uncategorized"
 
                     new_topics.append({
                         "topic": headline,
                         "category": final_cat,
                         "source": "tavily_discovery",
-                        "context": content[:600]
+                        "context": content[:600],
+                        "age_hours_at_fetch": age_hours_at_fetch,
+                        "fetched_at": fetch_ts
                     })
 
-                # Cache results for 6 hours
+                # Cache results
                 if new_topics:
                     set_tavily_cache(cache_key, _json.dumps(new_topics))
                     topics.extend(new_topics)
@@ -1787,21 +1807,27 @@ async def send_telegram(chat_id: int, text: str, reply_markup: dict = None, pars
     return None
 
 async def send_article_for_approval(article_id: int, title: str, excerpt: str, category: str, topic: str):
+    if category == "uncategorized":
+        cat_display = "⚠️ UNCATEGORIZED — Assign category before approving"
+        markup = {"inline_keyboard": [[
+            {"text": "📂 Assign Category", "callback_data": f"changecat_{article_id}"},
+            {"text": "❌ Reject", "callback_data": f"reject_{article_id}"}
+        ]]}
+    else:
+        cat_display = category.upper()
+        markup = {"inline_keyboard": [[
+            {"text": "✅ Approve", "callback_data": f"approve_{article_id}"},
+            {"text": "❌ Reject", "callback_data": f"reject_{article_id}"},
+            {"text": "📂 Change Category", "callback_data": f"changecat_{article_id}"}
+        ]]}
     text = (
         f"📰 <b>New Article Ready</b>\n\n"
         f"<b>Trending:</b> {topic}\n"
-        f"<b>Category:</b> {category.upper()}\n\n"
+        f"<b>Category:</b> {cat_display}\n\n"
         f"<b>Title:</b>\n{title}\n\n"
         f"<b>Excerpt:</b>\n{excerpt}\n\n"
         f"<b>ID:</b> #{article_id}"
     )
-    markup = {"inline_keyboard": [
-        [
-            {"text": "✅ Approve", "callback_data": f"approve_{article_id}"},
-            {"text": "❌ Reject", "callback_data": f"reject_{article_id}"},
-            {"text": "📂 Change Category", "callback_data": f"changecat_{article_id}"}
-        ]
-    ]}
     await send_to_all_admins(text, reply_markup=markup)
 
 # ── TOPIC TRACKING ──
@@ -2078,10 +2104,10 @@ async def run_pipeline(force_category: str = None):
                 is_dup = False
                 for seen in seen_topics_this_run:
                     t_words = set(w for w in re.findall(r'\b\w{5,}\b', topic_lower)
-                                  if w not in {"nigeria","nigerian","latest","news","today","2026"})
+                                  if w not in {"nigeria","nigerian","latest","news","today","2026","flash","naija"})
                     s_words = set(w for w in re.findall(r'\b\w{5,}\b', seen)
-                                  if w not in {"nigeria","nigerian","latest","news","today","2026"})
-                    if len(t_words & s_words) >= 2:
+                                  if w not in {"nigeria","nigerian","latest","news","today","2026","flash","naija"})
+                    if len(t_words & s_words) >= 1 and len(t_words) > 0:
                         is_dup = True
                         break
 
@@ -2199,6 +2225,17 @@ async def run_pipeline(force_category: str = None):
             await send_to_all_admins("⚠️ Pipeline ran but failed to generate articles. Check Railway logs.")
         else:
             logger.info(f"Pipeline {label} done. {generated} articles generated.")
+            # Clear topic-level Tavily cache so next run fetches fresh results
+            try:
+                conn = get_db()
+                cur = conn.cursor()
+                cur.execute("DELETE FROM tavily_cache WHERE cache_key LIKE 'topics_%'")
+                conn.commit()
+                cur.close()
+                conn.close()
+                logger.info("Cleared topic cache after successful pipeline run")
+            except Exception as e:
+                logger.error(f"Cache clear error: {e}")
 
     except Exception as e:
         logger.error(f"Pipeline error: {e}")
