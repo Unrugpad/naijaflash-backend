@@ -35,6 +35,8 @@ GNEWS_API_KEY = os.getenv("GNEWS_API_KEY")
 TAVILY_API_KEY = os.getenv("TAVILY_API_KEY")
 
 CATEGORIES = ["entertainment", "finance", "tech", "health", "education", "news", "football", "uncategorized"]
+# REAL_CATEGORIES = searchable categories only (uncategorized is a destination, not searchable)
+REAL_CATEGORIES = ["entertainment", "finance", "tech", "health", "education", "news", "football"]
 
 # ── KEYWORD SETS ──
 # "vs" pattern handled separately — always football
@@ -167,7 +169,31 @@ KNOWN_TEAMS = [
 
 # ── DB ──
 def get_db():
+    """
+    Returns a DB connection. Callers should call conn.close() as normal.
+    Safety net against leaks (Bug #4): psycopg2 connections close themselves
+    when garbage-collected, so an abandoned connection (one whose close() was
+    skipped by an exception) is reclaimed rather than leaking until the pool fills.
+    """
     return psycopg2.connect(DATABASE_URL, cursor_factory=RealDictCursor)
+
+from contextlib import contextmanager
+
+@contextmanager
+def db_conn():
+    """
+    Preferred pattern for new code — guarantees close() even on error:
+        with db_conn() as conn:
+            cur = conn.cursor(); cur.execute(...); conn.commit()
+    """
+    conn = get_db()
+    try:
+        yield conn
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
 
 def init_db():
     conn = get_db()
@@ -953,17 +979,29 @@ async def fetch_nigeria_trends(run_categories: List[str]) -> List[dict]:
                     # Check freshness of results
                     fetch_ts = datetime.now(timezone.utc).timestamp()
                     fresh_results = []
+                    now_dt = datetime.now(timezone.utc)
+                    current_year = now_dt.year
+                    # Old-date patterns to catch undated stale articles
+                    old_year_patterns = [str(y) for y in range(2020, current_year)]
                     for res in results:
                         pub_date = res.get("published_date", "") or ""
+                        content_text = res.get("content", "") or ""
+                        title_text = res.get("title", "") or ""
                         age_hours = 0
                         if pub_date:
                             try:
                                 pub_dt = datetime.fromisoformat(pub_date.replace("Z", "+00:00"))
-                                age_hours = (datetime.now(timezone.utc) - pub_dt).total_seconds() / 3600
+                                age_hours = (now_dt - pub_dt).total_seconds() / 3600
                                 if age_hours > 72:  # Allow up to 72 hours for context
                                     continue
                             except:
                                 pass
+                        else:
+                            # No pub_date — scan title for an explicit old year
+                            tl = title_text.lower()
+                            if any(f" {y}" in tl or f"({y})" in tl or f",{y}" in tl for y in old_year_patterns):
+                                logger.info(f"Skipping stale-dated source: {title_text[:40]}")
+                                continue
                         fresh_results.append(res)
 
                     if not fresh_results and not answer:
@@ -1666,17 +1704,19 @@ def is_article_quality_ok(article: dict) -> tuple:
     if len(title) < 15:
         return False, f"Title too short: '{title}'"
 
-    # Suspicious phrases indicating AI had no real data and fabricated
+    # Suspicious phrases indicating the AI itself had no data and is talking to us
+    # (first-person AI admissions only — NOT normal journalistic caution like "not confirmed")
     bad_phrases = [
-        "not mentioned", "not reported", "no data", "not available",
-        "i cannot", "i don't have", "as of my knowledge",
-        "i'm not sure", "it is unclear", "cannot confirm",
-        "no information", "not confirmed", "unverified"
+        "i cannot", "i don't have", "i do not have", "as of my knowledge",
+        "i'm not sure", "i am not sure", "as an ai", "i couldn't find",
+        "i could not find", "no data was provided", "the data provided",
+        "based on the information provided", "the article above", "the context provided",
+        "i apologize", "as a language model"
     ]
     combined = (title + " " + excerpt + " " + body).lower()
     for phrase in bad_phrases:
         if phrase in combined:
-            return False, f"AI admitted uncertainty: '{phrase}' found in content"
+            return False, f"AI spoke in first person: '{phrase}' found in content"
 
     # Body too short
     if len(body) < 200:
@@ -2170,7 +2210,7 @@ async def run_pipeline(force_category: str = None):
         if force_category:
             run_cats = [force_category]
         else:
-            run_cats = CATEGORIES  # /generate searches ALL 7 categories
+            run_cats = REAL_CATEGORIES  # /generate searches all 7 real categories (not uncategorized)
 
         trends = await fetch_nigeria_trends(run_cats)
 
@@ -2581,6 +2621,15 @@ async def telegram_webhook(request: Request):
             cb = data["callback_query"]
             cb_data = cb.get("data","")
             user_id = cb["from"]["id"]
+            # Answer callback IMMEDIATELY (Bug #6 fix) — prevents Telegram resending the webhook
+            try:
+                async with httpx.AsyncClient(timeout=5) as client:
+                    await client.post(
+                        f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/answerCallbackQuery",
+                        json={"callback_query_id": cb["id"]}
+                    )
+            except Exception:
+                pass
             if not is_admin(user_id):
                 return {"ok": True}
             if cb_data.startswith("approve_"):
@@ -2617,12 +2666,12 @@ async def telegram_webhook(request: Request):
 
             elif cb_data.startswith("changecat_"):
                 article_id = int(cb_data.split("_")[1])
-                # Show category selection buttons
+                # Show category selection buttons (real categories only — not uncategorized)
                 cat_buttons = []
                 cat_emojis = {"football":"⚽","finance":"💰","entertainment":"🎭","tech":"📱","health":"🏥","education":"📚","news":"📰"}
                 row = []
-                for cat in CATEGORIES:
-                    row.append({"text": f"{cat_emojis.get(cat,'')} {cat.capitalize()}", "callback_data": f"setcat_{article_id}_{cat}"})
+                for cat in REAL_CATEGORIES:
+                    row.append({"text": f"{cat_emojis.get(cat,'📄')} {cat.capitalize()}", "callback_data": f"setcat_{article_id}_{cat}"})
                     if len(row) == 3:
                         cat_buttons.append(row)
                         row = []
@@ -2639,15 +2688,29 @@ async def telegram_webhook(request: Request):
                 new_cat = parts[2]
                 conn = get_db()
                 cur = conn.cursor()
-                cur.execute("UPDATE articles SET category=%s WHERE id=%s RETURNING title", (new_cat, article_id))
+                cur.execute("UPDATE articles SET category=%s WHERE id=%s RETURNING title, excerpt", (new_cat, article_id))
                 row = cur.fetchone()
                 conn.commit()
                 cur.close()
                 conn.close()
                 if row:
+                    # Re-show article with full approval buttons (Bug #2 fix)
+                    approval_markup = {"inline_keyboard": [
+                        [
+                            {"text": "✅ Approve", "callback_data": f"approve_{article_id}"},
+                            {"text": "❌ Reject", "callback_data": f"reject_{article_id}"}
+                        ],
+                        [
+                            {"text": "✏️ Edit Article", "callback_data": f"edit_{article_id}"},
+                            {"text": "📂 Change Category", "callback_data": f"changecat_{article_id}"}
+                        ]
+                    ]}
                     await send_to_all_admins(
-                        f"📂 Article #{article_id} moved to <b>{new_cat.upper()}</b>\n"
-                        f"Title: {row['title'][:60]}"
+                        f"📂 Article #{article_id} moved to <b>{new_cat.upper()}</b>\n\n"
+                        f"📰 <b>Title:</b>\n{row['title']}\n\n"
+                        f"📝 <b>Excerpt:</b>\n{row['excerpt']}\n\n"
+                        f"Now ready to approve:",
+                        reply_markup=approval_markup
                     )
 
             elif cb_data.startswith("pub_sponsored_"):
@@ -2721,8 +2784,6 @@ async def telegram_webhook(request: Request):
                 session_chat_id = int(cb_data.split("_")[2])
                 clear_sponsored_session(session_chat_id)
                 await send_telegram(cb["from"]["id"], "✅ Sponsored article cancelled.")
-            async with httpx.AsyncClient() as client:
-                await client.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/answerCallbackQuery", json={"callback_query_id": cb["id"]})
 
         elif "message" in data:
             msg = data["message"]
@@ -2855,7 +2916,7 @@ Return ONLY this JSON — no markdown, no preamble:
                     await send_telegram(chat_id, "⛔ Admins only.")
                     return {"ok": True}
                 await send_telegram(chat_id, "🔍 Fetching Nigeria trends across all categories...")
-                trends = await fetch_nigeria_trends()
+                trends = await fetch_nigeria_trends(REAL_CATEGORIES)
                 if not trends:
                     await send_telegram(chat_id, "No relevant trends found right now.")
                 else:
