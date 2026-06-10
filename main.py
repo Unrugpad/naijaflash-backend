@@ -1642,7 +1642,35 @@ Return ONLY this JSON — no markdown, no explanation, no preamble:
   "image_query": "3-word image search query"
 }}"""
 
-    # Try Groq first
+    # Use Claude Haiku for trending articles (accurate), Groq for evergreen (free)
+    if not is_evergreen and ANTHROPIC_API_KEY:
+        try:
+            async with httpx.AsyncClient(timeout=30) as client:
+                r = await client.post(
+                    "https://api.anthropic.com/v1/messages",
+                    headers={
+                        "x-api-key": ANTHROPIC_API_KEY,
+                        "anthropic-version": "2023-06-01",
+                        "content-type": "application/json"
+                    },
+                    json={
+                        "model": "claude-haiku-4-5-20251001",
+                        "max_tokens": 2500,
+                        "messages": [{"role": "user", "content": prompt}]
+                    }
+                )
+                data = r.json()
+                text = data["content"][0]["text"].strip()
+                text = text.replace("```json","").replace("```","").strip()
+                match = re.search(r'\{.*\}', text, re.DOTALL)
+                if match:
+                    text = match.group(0)
+                logger.info(f"Claude Haiku wrote article for: {topic[:50]}")
+                return json.loads(text)
+        except Exception as e:
+            logger.error(f"Claude Haiku failed: {e} — falling back to Groq")
+
+    # Groq for evergreen articles (free tier)
     if GROQ_API_KEY:
         try:
             client = groq.Groq(api_key=GROQ_API_KEY)
@@ -1654,22 +1682,30 @@ Return ONLY this JSON — no markdown, no explanation, no preamble:
             )
             text = response.choices[0].message.content.strip()
             text = text.replace("```json","").replace("```","").strip()
-            # Find JSON in response in case there's extra text
             match = re.search(r'\{.*\}', text, re.DOTALL)
             if match:
                 text = match.group(0)
+            logger.info(f"Groq wrote article for: {topic[:50]}")
             return json.loads(text)
         except Exception as e:
             logger.error(f"Groq failed: {e}")
 
-    # Claude fallback
+    # Last resort — Claude Haiku even for evergreen
     if ANTHROPIC_API_KEY:
         try:
             async with httpx.AsyncClient(timeout=30) as client:
                 r = await client.post(
                     "https://api.anthropic.com/v1/messages",
-                    headers={"x-api-key": ANTHROPIC_API_KEY, "anthropic-version": "2023-06-01", "content-type": "application/json"},
-                    json={"model": "claude-haiku-4-5-20251001", "max_tokens": 2500, "messages": [{"role": "user", "content": prompt}]}
+                    headers={
+                        "x-api-key": ANTHROPIC_API_KEY,
+                        "anthropic-version": "2023-06-01",
+                        "content-type": "application/json"
+                    },
+                    json={
+                        "model": "claude-haiku-4-5-20251001",
+                        "max_tokens": 2500,
+                        "messages": [{"role": "user", "content": prompt}]
+                    }
                 )
                 data = r.json()
                 text = data["content"][0]["text"].strip()
@@ -1681,7 +1717,7 @@ Return ONLY this JSON — no markdown, no explanation, no preamble:
         except Exception as e:
             logger.error(f"Claude fallback failed: {e}")
 
-    raise Exception("Both Groq and Claude API failed")
+    raise Exception("All AI APIs failed")
 
 # ── TELEGRAM ──
 async def send_to_all_admins(text: str, reply_markup: dict = None):
@@ -1922,55 +1958,61 @@ async def run_pipeline(force_category: str = None):
         if force_category:
             cat_trends = [t for t in trends if t["category"] == force_category]
             new_cat_trends = [t for t in cat_trends if not is_topic_used(t["topic"])]
+            selected = new_cat_trends[:2]
 
-            if new_cat_trends:
-                selected = new_cat_trends[:2]  # Max 2 per category per run
-                logger.info(f"Using {len(selected)} trending topics for {force_category}")
-            else:
+            # Fill to 2 with evergreen if needed
+            while len(selected) < 2:
                 fallback = get_fallback_topic(force_category)
-                if not fallback:
-                    await send_to_all_admins(f"⚠️ No topics available for <b>{force_category.upper()}</b>.")
-                    return
-                selected = [fallback]
-                logger.info(f"Using evergreen fallback for {force_category}: {fallback['topic']}")
-                await send_to_all_admins(
-                    f"ℹ️ No trending topics for <b>{force_category.upper()}</b> right now.\n"
-                    f"Using evergreen topic: <i>{fallback['topic']}</i>"
-                )
+                if not fallback or is_topic_used(fallback["topic"]):
+                    break
+                selected.append(fallback)
+
+            if not selected:
+                await send_to_all_admins(f"⚠️ No topics available for <b>{force_category.upper()}</b>.")
+                return
+
+            evergreen_count = sum(1 for t in selected if t.get("source") == "evergreen")
+            trending_count = len(selected) - evergreen_count
+            status = f"⚙️ Generating {len(selected)} <b>{force_category.upper()}</b> articles"
+            if evergreen_count > 0:
+                status += f" ({trending_count} trending + {evergreen_count} evergreen)"
+            await send_to_all_admins(status)
         else:
-            # All categories — pick max 1 topic per category, diverse coverage
+            # All categories — pick max 2 topics per category
             new_trends = [t for t in trends if not is_topic_used(t["topic"])]
+            selected = []
+            seen_cats = {}
 
             if new_trends:
-                # Pick best topic per category (max 1 each, max 5 total)
-                seen_cats = {}
-                selected = []
+                # First pass: pick up to 2 trending topics per category
                 for t in new_trends:
                     cat = t["category"]
-                    if cat not in seen_cats:
-                        seen_cats[cat] = 0
-                    if seen_cats[cat] < 1 and len(selected) < 5:
+                    seen_cats[cat] = seen_cats.get(cat, 0)
+                    if seen_cats[cat] < 2:
                         selected.append(t)
                         seen_cats[cat] += 1
-            else:
-                cat = random.choice(CATEGORIES)
-                fallback = get_fallback_topic(cat)
-                if not fallback:
-                    await send_to_all_admins("ℹ️ All topics already covered. Try again later.")
-                    return
-                selected = [fallback]
-                await send_to_all_admins(
-                    f"ℹ️ No new trending topics right now.\n"
-                    f"Using evergreen topic: <i>{fallback['topic']}</i>"
-                )
 
-            # Send ONE combined status message for all categories
-            if selected:
-                cats_found = list({t["category"] for t in selected})
-                cat_labels = " · ".join([c.upper() for c in cats_found])
-                await send_to_all_admins(
-                    f"⚙️ Generating {len(selected)} articles across: {cat_labels}"
-                )
+            # Second pass: fill any category with < 2 articles using evergreen
+            run_cats = get_categories_for_run()
+            for cat in run_cats:
+                current_count = seen_cats.get(cat, 0)
+                needed = 2 - current_count
+                for _ in range(needed):
+                    fallback = get_fallback_topic(cat)
+                    if fallback and not is_topic_used(fallback["topic"]):
+                        selected.append(fallback)
+                        seen_cats[cat] = seen_cats.get(cat, 0) + 1
+
+            if not selected:
+                await send_to_all_admins("ℹ️ All topics already covered. Try /reset to start fresh.")
+                return
+
+            # Send ONE combined status message
+            cats_found = list({t["category"] for t in selected})
+            cat_labels = " · ".join([c.upper() for c in sorted(cats_found)])
+            await send_to_all_admins(
+                f"⚙️ Generating {len(selected)} articles across: {cat_labels}"
+            )
 
         # Process selected topics
         for trend in selected:
