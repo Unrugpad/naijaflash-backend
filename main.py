@@ -242,6 +242,13 @@ def init_db():
         );
         CREATE INDEX IF NOT EXISTS idx_tavily_cache_key ON tavily_cache(cache_key);
         CREATE INDEX IF NOT EXISTS idx_tavily_cache_time ON tavily_cache(created_at DESC);
+        CREATE TABLE IF NOT EXISTS app_settings (
+            key VARCHAR(100) PRIMARY KEY,
+            value TEXT NOT NULL,
+            updated_at TIMESTAMP DEFAULT NOW()
+        );
+        INSERT INTO app_settings (key, value) VALUES ('category_rotation_index', '-1')
+        ON CONFLICT (key) DO NOTHING;
         CREATE INDEX IF NOT EXISTS idx_articles_status ON articles(status);
         CREATE INDEX IF NOT EXISTS idx_articles_category ON articles(category);
         CREATE INDEX IF NOT EXISTS idx_articles_created ON articles(created_at DESC);
@@ -635,67 +642,58 @@ ALL_CATEGORIES_ORDERED = ["news", "football", "finance", "entertainment", "tech"
 
 def get_categories_for_run() -> List[str]:
     """
-    Return categories for this pipeline run.
+    Return categories for this pipeline run using app_settings table.
     Run 1: news, football, finance, entertainment (4)
     Run 2: tech, health, education (3)
-    Stores rotation in used_topics table (persists across resets).
+    Perfectly alternates every time — never resets unless /resetrotation is called.
     """
+    # Read last index from app_settings
     last_index = -1
     try:
         conn = get_db()
         cur = conn.cursor()
-        # Check used_topics first (preferred, persistent)
-        cur.execute("SELECT topic FROM used_topics WHERE topic LIKE '_rotation_%'")
+        cur.execute("SELECT value FROM app_settings WHERE key='category_rotation_index'")
         row = cur.fetchone()
         if row:
-            last_index = int(row["topic"].replace("_rotation_", ""))
-        else:
-            # Fall back to tavily_cache (legacy)
-            cur.execute("SELECT result FROM tavily_cache WHERE cache_key='_category_rotation'")
-            row2 = cur.fetchone()
-            if row2:
-                last_index = int(row2["result"])
-                # Migrate to used_topics and remove from cache
-                cur.execute("DELETE FROM tavily_cache WHERE cache_key='_category_rotation'")
-                logger.info(f"Migrated rotation from tavily_cache: last_index={last_index}")
+            last_index = int(row["value"])
         cur.close()
         conn.close()
     except Exception as e:
         logger.error(f"Rotation read error: {e}")
-        last_index = -1
 
     n = len(ALL_CATEGORIES_ORDERED)
     start = (last_index + 1) % n
 
-    # 4 then 3 alternating
-    remaining_in_cycle = n - start
-    if remaining_in_cycle >= 4:
+    # 4 then 3 alternating — covers all 7 in 2 runs with no overlap
+    remaining = n - start
+    if remaining >= 4:
         batch_size = 4
+    elif remaining >= 3:
+        batch_size = remaining
     else:
-        batch_size = remaining_in_cycle
-    if batch_size < 3:
+        # Wrap around — start fresh
         start = 0
         batch_size = 4
 
     selected = [ALL_CATEGORIES_ORDERED[(start + i) % n] for i in range(batch_size)]
     next_index = (start + batch_size - 1) % n
 
-    # Save to used_topics
+    # Save next index to app_settings
     try:
         conn = get_db()
         cur = conn.cursor()
-        cur.execute("DELETE FROM used_topics WHERE topic LIKE '_rotation_%'")
-        cur.execute(
-            "INSERT INTO used_topics (topic) VALUES (%s) ON CONFLICT DO NOTHING",
-            (f"_rotation_{next_index}",)
-        )
+        cur.execute("""
+            INSERT INTO app_settings (key, value, updated_at)
+            VALUES ('category_rotation_index', %s, NOW())
+            ON CONFLICT (key) DO UPDATE SET value=%s, updated_at=NOW()
+        """, (str(next_index), str(next_index)))
         conn.commit()
         cur.close()
         conn.close()
     except Exception as e:
         logger.error(f"Rotation save error: {e}")
 
-    logger.info(f"Category rotation: {selected} (saved index {next_index}, next run starts {ALL_CATEGORIES_ORDERED[(next_index+1)%n]})")
+    logger.info(f"Rotation: {selected} | saved index={next_index} | next run starts at {ALL_CATEGORIES_ORDERED[(next_index+1)%n]}")
     return selected
 
 async def fetch_topics_from_tavily(category: str, queries) -> List[dict]:
@@ -2755,7 +2753,6 @@ async def telegram_webhook(request: Request):
                     cur = conn.cursor()
                     cur.execute("SELECT COUNT(*) as c FROM used_topics WHERE topic NOT LIKE '_rotation_%'")
                     count = cur.fetchone()["c"]
-                    # Delete used topics but PRESERVE rotation marker
                     cur.execute("DELETE FROM used_topics WHERE topic NOT LIKE '_rotation_%'")
                     conn.commit()
                     cur.close()
@@ -2775,9 +2772,14 @@ async def telegram_webhook(request: Request):
                 try:
                     conn = get_db()
                     cur = conn.cursor()
-                    # Clear rotation marker — next run starts from NEWS (index 0)
+                    # Reset to -1 so next run starts from index 0 (news)
+                    cur.execute("""
+                        INSERT INTO app_settings (key, value, updated_at)
+                        VALUES ('category_rotation_index', '-1', NOW())
+                        ON CONFLICT (key) DO UPDATE SET value='-1', updated_at=NOW()
+                    """)
+                    # Clean up old rotation markers from other tables
                     cur.execute("DELETE FROM used_topics WHERE topic LIKE '_rotation_%'")
-                    # Also clear from tavily_cache in case old value is there
                     cur.execute("DELETE FROM tavily_cache WHERE cache_key='_category_rotation'")
                     conn.commit()
                     cur.close()
