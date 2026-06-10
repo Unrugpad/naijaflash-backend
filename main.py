@@ -2307,16 +2307,24 @@ async def run_pipeline(force_category: str = None):
                     football_data = await fetch_football_data(topic)
                     is_match = bool(re.search(r'\bvs?\b', topic.lower()) or ' v ' in topic.lower())
                     if is_match:
-                        # Use pre-fetched context or fetch fresh
-                        news_data = tavily_context if tavily_context else await fetch_news_context(topic, category)
-                        if football_data:
+                        # HARD CHECK: if data says UPCOMING, override topic to force preview
+                        if football_data and "UPCOMING MATCH" in football_data:
+                            # Extract team names and rewrite topic as preview
+                            preview_topic = f"{topic} preview prediction"
+                            logger.info(f"Match not played yet — forcing preview for: {topic}")
+                            topic = preview_topic
+                            real_data = f"IMPORTANT: THIS MATCH HAS NOT BEEN PLAYED YET.\n{football_data}\n\nWrite a PREVIEW article only. DO NOT write any score, result, or outcome."
+                        elif football_data and "COMPLETED MATCH" in football_data:
+                            news_data = tavily_context if tavily_context else await fetch_news_context(topic, category)
                             real_data = f"AUTHORITATIVE MATCH DATA (use this for scores/results):\n{football_data}"
                             if news_data:
                                 real_data += f"\n\nNEWS CONTEXT (for quotes/background only — never use for scores):\n{news_data}"
                         else:
-                            real_data = news_data
+                            # No API data — check Tavily context for any score
+                            ctx = tavily_context or await fetch_news_context(topic, category)
+                            # If no confirmed result in context, force preview
+                            real_data = f"IMPORTANT: No confirmed match result available.\nWrite a PREVIEW article only. DO NOT fabricate any score or result.\n\n{ctx}"
                     else:
-                        # Non-match football topic — use pre-fetched content
                         real_data = tavily_context if tavily_context else (football_data or await fetch_news_context(topic, category))
                 elif category == "finance":
                     finance_data = await fetch_finance_data(topic)
@@ -2772,21 +2780,33 @@ Return ONLY this JSON — no markdown, no preamble:
                             if match:
                                 import json as _json
                                 edited = _json.loads(match.group(0))
+                                new_title = edited.get("title", row["title"])
+                                new_excerpt = edited.get("excerpt", row["excerpt"])
+                                new_body = edited.get("body", row["body"])
                                 conn = get_db()
                                 cur = conn.cursor()
                                 cur.execute("""
                                     UPDATE articles SET title=%s, excerpt=%s, body=%s WHERE id=%s
-                                """, (edited.get("title", row["title"]),
-                                      edited.get("excerpt", row["excerpt"]),
-                                      edited.get("body", row["body"]),
-                                      article_id))
+                                """, (new_title, new_excerpt, new_body, article_id))
                                 conn.commit()
                                 cur.close()
                                 conn.close()
+                                # Show updated article for review
+                                review_markup = {"inline_keyboard": [
+                                    [
+                                        {"text": "✅ Approve", "callback_data": f"approve_{article_id}"},
+                                        {"text": "❌ Reject", "callback_data": f"reject_{article_id}"}
+                                    ],
+                                    [
+                                        {"text": "✏️ Edit Again", "callback_data": f"edit_{article_id}"},
+                                        {"text": "📂 Change Category", "callback_data": f"changecat_{article_id}"}
+                                    ]
+                                ]}
                                 await send_telegram(chat_id,
-                                    f"✅ <b>Article #{article_id} updated!</b>\n\n"
-                                    f"<b>New title:</b> {edited.get('title', row['title'])}\n\n"
-                                    f"You can now approve it with /approve {article_id}"
+                                    f"✅ <b>Article #{article_id} updated — review before approving:</b>\n\n"
+                                    f"📰 <b>Title:</b>\n{new_title}\n\n"
+                                    f"📝 <b>Excerpt:</b>\n{new_excerpt}",
+                                    reply_markup=review_markup
                                 )
                             else:
                                 await send_telegram(chat_id, "❌ Edit failed — could not parse response. Try again.")
