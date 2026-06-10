@@ -1621,6 +1621,16 @@ async def generate_article(topic: str, category: str, real_data: str = "", is_ev
             "\n- For security/attack articles: include official government response and security forces reaction"
             "\n- Never present unverified death tolls as confirmed — say 'at least' or 'according to sources'"
         )
+    elif category == "education":
+        extra_instructions = (
+            "\nEDUCATION RULES:"
+            "\n- UNIVERSITY RANKING: Per Times Higher Education 2026, UI (University of Ibadan) and UNILAG (University of Lagos) are jointly ranked #1 in Nigeria — NOT University of Nigeria Nsukka (UNN)"
+            "\n- Covenant University is top-ranked private university in Nigeria"
+            "\n- JAMB cut-off 2026: 150 for universities, 100 for polytechnics"
+            "\n- NECO 2026 SSCE runs June 15 to July 23, 2026"
+            "\n- WAEC 2026 WASSCE runs April 21 to June 19, 2026"
+            "\n- Never state exam results as released unless data confirms it"
+        )
     elif category == "entertainment":
         extra_instructions = (
             "\nENTERTAINMENT RULES:"
@@ -2733,16 +2743,17 @@ async def telegram_webhook(request: Request):
                 try:
                     conn = get_db()
                     cur = conn.cursor()
-                    cur.execute("SELECT COUNT(*) as c FROM used_topics")
+                    cur.execute("SELECT COUNT(*) as c FROM used_topics WHERE topic NOT LIKE '_rotation_%'")
                     count = cur.fetchone()["c"]
-                    cur.execute("DELETE FROM used_topics")
+                    # Delete used topics but PRESERVE rotation marker
+                    cur.execute("DELETE FROM used_topics WHERE topic NOT LIKE '_rotation_%'")
                     conn.commit()
                     cur.close()
                     conn.close()
                     await send_telegram(chat_id,
                         f"♻️ <b>Reset complete.</b>\n\n"
                         f"Cleared {count} used topics.\n"
-                        f"All trends are now fresh — send /generate to start."
+                        f"Category rotation preserved — send /generate to continue."
                     )
                 except Exception as e:
                     await send_telegram(chat_id, f"❌ Reset error: {e}")
