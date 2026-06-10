@@ -464,6 +464,9 @@ WEBSITE_NAME_PATTERNS = [
     r'[A-Za-z]\.$',
     # Oyebanji style broken markdown
     r']\(https?://\S+\.(jpg|png|gif|webp)',
+    # Wire service titles with explicit old year references
+    r'^ap\s*\(associated press\)',
+    r'^(reuters|afp|ap)[,:\s]',
     # Markdown table rows | **text** |
     r'^\|\s*\*{1,2}.+\*{1,2}\s*\|',
     r'^\|.+\|\s*\d+gb.+\|',
@@ -608,9 +611,21 @@ async def fetch_topics_from_tavily(category: str, queries) -> List[dict]:
                             pub_dt = datetime.fromisoformat(pub_date.replace("Z", "+00:00"))
                             age_days = (datetime.now(timezone.utc) - pub_dt).days
                             if age_days > 14:
+                                logger.info(f"Skipping old result ({age_days}d old): {page_title[:50]}")
                                 continue
                         except Exception:
                             pass
+
+                    # Extra check: reject if content clearly references old years
+                    content_lower = content.lower()
+                    title_lower = page_title.lower()
+                    current_year = datetime.now().year
+                    old_years = [str(y) for y in range(2020, current_year - 1)]
+                    # If title contains an old year explicitly (e.g. "May 2024"), skip
+                    for old_year in old_years:
+                        if f" {old_year}" in title_lower or f"({old_year})" in title_lower:
+                            logger.info(f"Skipping old-year result ({old_year}): {page_title[:50]}")
+                            continue
 
                     skip_domains = ["google.com","bing.com","yahoo.com","reddit.com",
                                     "wikipedia.org","facebook.com","twitter.com","x.com",
@@ -1453,6 +1468,15 @@ async def generate_article(topic: str, category: str, real_data: str = "", is_ev
             "\n- Drug prices must be stated as approximate and subject to change"
             "\n- Never recommend specific dosages — direct readers to a pharmacist or doctor"
         )
+    elif category == "news":
+        extra_instructions = (
+            "\nNEWS RULES:"
+            "\n- CURRENT NEWS ONLY: Only write about events that happened in the last 30 days. If the real data describes an event from 2024 or earlier, do NOT write about it as current news"
+            "\n- Always state when something happened — include the date or month"
+            "\n- For government policy articles: include both positive and negative angles — never one-sided"
+            "\n- For security/attack articles: include official government response and security forces reaction"
+            "\n- Never present unverified death tolls as confirmed — say 'at least' or 'according to sources'"
+        )
     elif category == "entertainment":
         extra_instructions = (
             "\nENTERTAINMENT RULES:"
@@ -1726,16 +1750,16 @@ EVERGREEN_TOPICS = {
         "CBN new banking policy Nigerians must know",
     ],
     "football": [
-        "Super Eagles 2026 FIFA World Cup squad players",
-        "Victor Osimhen latest goals news and transfer",
+        "Victor Osimhen latest goals news and transfer 2026",
         "Premier League top scorer golden boot race 2026",
-        "Champions League final result and highlights",
-        "Nigeria World Cup 2026 fixtures and schedule",
-        "Ademola Lookman Atalanta latest goals news",
-        "AFCON 2025 Nigeria qualification latest update",
-        "Premier League results and table standings 2026",
-        "Real Madrid vs Barcelona El Clasico latest",
-        "Nigerian players in Europe latest performance news",
+        "Champions League final 2026 result winner",
+        "Ademola Lookman Atalanta latest goals and news 2026",
+        "AFCON 2027 Nigeria qualification latest update",
+        "Premier League 2025-26 final table champion winner",
+        "Real Madrid vs Barcelona El Clasico 2026 result",
+        "Nigerian players in Europe latest performance 2026",
+        "2026 FIFA World Cup group stage results today",
+        "Africa Cup of Nations 2027 qualifying standings",
     ],
 }
 
