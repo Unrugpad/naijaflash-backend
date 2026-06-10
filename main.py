@@ -638,54 +638,64 @@ def get_categories_for_run() -> List[str]:
     Return categories for this pipeline run.
     Run 1: news, football, finance, entertainment (4)
     Run 2: tech, health, education (3)
-    Run 3: news, football, finance, entertainment (4) again
-    Stores rotation index in DB to persist across runs.
+    Stores rotation in used_topics table (persists across resets).
     """
+    last_index = -1
     try:
         conn = get_db()
         cur = conn.cursor()
-        # Use a dedicated row in used_topics table to track rotation
+        # Check used_topics first (preferred, persistent)
         cur.execute("SELECT topic FROM used_topics WHERE topic LIKE '_rotation_%'")
         row = cur.fetchone()
-        last_index = int(row["topic"].replace("_rotation_", "")) if row else -1
+        if row:
+            last_index = int(row["topic"].replace("_rotation_", ""))
+        else:
+            # Fall back to tavily_cache (legacy)
+            cur.execute("SELECT result FROM tavily_cache WHERE cache_key='_category_rotation'")
+            row2 = cur.fetchone()
+            if row2:
+                last_index = int(row2["result"])
+                # Migrate to used_topics and remove from cache
+                cur.execute("DELETE FROM tavily_cache WHERE cache_key='_category_rotation'")
+                logger.info(f"Migrated rotation from tavily_cache: last_index={last_index}")
         cur.close()
         conn.close()
-    except:
+    except Exception as e:
+        logger.error(f"Rotation read error: {e}")
         last_index = -1
 
     n = len(ALL_CATEGORIES_ORDERED)
     start = (last_index + 1) % n
 
-    # Determine batch size — 4 then 3 alternating, covering all 7 in 2 runs
+    # 4 then 3 alternating
     remaining_in_cycle = n - start
     if remaining_in_cycle >= 4:
         batch_size = 4
     else:
-        batch_size = remaining_in_cycle  # Could be 3, 2, or 1
-
-    # Ensure minimum of 3
+        batch_size = remaining_in_cycle
     if batch_size < 3:
-        # Wrap around and reset
         start = 0
         batch_size = 4
 
     selected = [ALL_CATEGORIES_ORDERED[(start + i) % n] for i in range(batch_size)]
-
-    # Save next position
     next_index = (start + batch_size - 1) % n
+
+    # Save to used_topics
     try:
         conn = get_db()
         cur = conn.cursor()
         cur.execute("DELETE FROM used_topics WHERE topic LIKE '_rotation_%'")
-        cur.execute("INSERT INTO used_topics (topic) VALUES (%s) ON CONFLICT DO NOTHING",
-                    (f"_rotation_{next_index}",))
+        cur.execute(
+            "INSERT INTO used_topics (topic) VALUES (%s) ON CONFLICT DO NOTHING",
+            (f"_rotation_{next_index}",)
+        )
         conn.commit()
         cur.close()
         conn.close()
     except Exception as e:
         logger.error(f"Rotation save error: {e}")
 
-    logger.info(f"Category rotation: {selected} (next starts from index {(next_index+1)%n} = {ALL_CATEGORIES_ORDERED[(next_index+1)%n]})")
+    logger.info(f"Category rotation: {selected} (saved index {next_index}, next run starts {ALL_CATEGORIES_ORDERED[(next_index+1)%n]})")
     return selected
 
 async def fetch_topics_from_tavily(category: str, queries) -> List[dict]:
@@ -2546,7 +2556,7 @@ async def telegram_webhook(request: Request):
                     "/help — Show this message"
                 )
                 if is_owner(user_id):
-                    cmd += "\n\n👑 <b>Owner Commands</b>\n/addadmin [chat_id]\n/removeadmin [chat_id]\n/listadmins\n/reset — Clear used topics & start fresh"
+                    cmd += "\n\n👑 <b>Owner Commands</b>\n/addadmin [chat_id]\n/removeadmin [chat_id]\n/listadmins\n/reset — Clear used topics & start fresh\n/resetrotation — Reset category rotation to NEWS first"
                 await send_telegram(chat_id, cmd)
 
             elif text == "/trends":
@@ -2757,6 +2767,28 @@ async def telegram_webhook(request: Request):
                     )
                 except Exception as e:
                     await send_telegram(chat_id, f"❌ Reset error: {e}")
+
+            elif text == "/resetrotation":
+                if not is_owner(user_id):
+                    await send_telegram(chat_id, "⛔ Owner only.")
+                    return {"ok": True}
+                try:
+                    conn = get_db()
+                    cur = conn.cursor()
+                    # Clear rotation marker — next run starts from NEWS (index 0)
+                    cur.execute("DELETE FROM used_topics WHERE topic LIKE '_rotation_%'")
+                    # Also clear from tavily_cache in case old value is there
+                    cur.execute("DELETE FROM tavily_cache WHERE cache_key='_category_rotation'")
+                    conn.commit()
+                    cur.close()
+                    conn.close()
+                    await send_telegram(chat_id,
+                        f"🔄 <b>Rotation reset.</b>\n\n"
+                        f"Next /generate will start from:\n"
+                        f"<b>NEWS · FOOTBALL · FINANCE · ENTERTAINMENT</b>"
+                    )
+                except Exception as e:
+                    await send_telegram(chat_id, f"❌ Error: {e}")
 
             elif text.startswith("/delete"):
                 if not is_admin(user_id):
