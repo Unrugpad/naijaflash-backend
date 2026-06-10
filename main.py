@@ -2260,27 +2260,42 @@ async def run_pipeline(force_category: str = None):
 
                 # Google Trends topics already have Tavily content pre-fetched
                 # Only fetch additional data for football (API-Football) and finance (live rates)
+                # Track for post-generation check
+                _is_match = False
+                _confirmed_ft = False
+
                 if category == "football":
                     football_data = await fetch_football_data(topic)
-                    is_match = bool(re.search(r'\bvs?\b', topic.lower()) or ' v ' in topic.lower())
+                    _is_match = bool(re.search(r'\bvs?\.?\b', topic.lower()) or ' v ' in topic.lower())
+                    is_match = _is_match
                     if is_match:
-                        # HARD CHECK: if data says UPCOMING, override topic to force preview
-                        if football_data and "UPCOMING MATCH" in football_data:
-                            # Extract team names and rewrite topic as preview
-                            preview_topic = f"{topic} preview prediction"
-                            logger.info(f"Match not played yet — forcing preview for: {topic}")
-                            topic = preview_topic
-                            real_data = f"IMPORTANT: THIS MATCH HAS NOT BEEN PLAYED YET.\n{football_data}\n\nWrite a PREVIEW article only. DO NOT write any score, result, or outcome."
-                        elif football_data and "COMPLETED MATCH" in football_data:
+                        if football_data and "COMPLETED MATCH" in football_data:
+                            _confirmed_ft = True
+                            # Only allow match report when API-Football confirms FT
                             news_data = tavily_context if tavily_context else await fetch_news_context(topic, category)
                             real_data = f"AUTHORITATIVE MATCH DATA (use this for scores/results):\n{football_data}"
                             if news_data:
-                                real_data += f"\n\nNEWS CONTEXT (for quotes/background only — never use for scores):\n{news_data}"
+                                real_data += f"\n\nNEWS CONTEXT (background only — never use for scores):\n{news_data}"
                         else:
-                            # No API data — check Tavily context for any score
-                            ctx = tavily_context or await fetch_news_context(topic, category)
-                            # If no confirmed result in context, force preview
-                            real_data = f"IMPORTANT: No confirmed match result available.\nWrite a PREVIEW article only. DO NOT fabricate any score or result.\n\n{ctx}"
+                            # No confirmed FT result — HARD FORCE preview
+                            # Strip any score/result language from context to prevent AI fabrication
+                            ctx = tavily_context or ""
+                            # Remove lines mentioning scores to prevent AI from using them
+                            safe_lines = []
+                            score_patterns = re.compile(r'\d+[-–]\d+|\bgoal\b|\bscored\b|\bscore\b|\bwins?\b|\bdefeats?\b|\bbeats?\b|\bfull.?time\b|\bFT\b|\bhalf.?time\b|\bHT\b', re.IGNORECASE)
+                            for line in ctx.split('\n'):
+                                if not score_patterns.search(line):
+                                    safe_lines.append(line)
+                            safe_ctx = '\n'.join(safe_lines)
+                            real_data = (
+                                "⛔ CRITICAL INSTRUCTION: THIS MATCH HAS NOT FINISHED OR MAY BE IN PROGRESS.\n"
+                                "YOU MUST WRITE A MATCH PREVIEW ONLY.\n"
+                                "DO NOT write any final score, result, winner, or goals scored.\n"
+                                "DO NOT use words like 'beat', 'defeated', 'won', 'lost', 'scored' in past tense for this match.\n"
+                                "Write about: team form, key players to watch, predictions, tournament context.\n\n"
+                                f"SAFE BACKGROUND CONTEXT (no live scores):\n{safe_ctx}"
+                            )
+                            logger.info(f"Match not confirmed FT — forced preview, stripped scores: {topic}")
                     else:
                         real_data = tavily_context if tavily_context else (football_data or await fetch_news_context(topic, category))
                 elif category == "finance":
@@ -2304,6 +2319,16 @@ async def run_pipeline(force_category: str = None):
                     logger.warning(f"Article quality failed for '{topic}': {reason}")
                     await send_to_all_admins(f"⚠️ Article for <b>{topic}</b> failed quality check: {reason}\nSkipping — try again later.")
                     continue
+
+                # Extra check: reject football articles that fabricated a result for unconfirmed matches
+                if category == "football" and _is_match and not _confirmed_ft:
+                    article_text = (article_data.get("title","") + " " + article_data.get("excerpt","") + " " + article_data.get("body","")).lower()
+                    score_in_article = bool(re.search(r'\b\d+[-–]\d+\b', article_text))
+                    result_words = any(w in article_text for w in ["beat ", "beats ", "defeated ", "won the match", "victory over", "scores twice", "hat-trick"])
+                    if score_in_article or result_words:
+                        logger.warning(f"Rejected fabricated match result for: {topic}")
+                        await send_to_all_admins(f"⚠️ Article for <b>{topic}</b> rejected — AI fabricated a match result. Skipped.")
+                        continue
 
                 image_url = await fetch_image(article_data.get("image_query", topic), category, article_data.get("title",""))
 
