@@ -234,6 +234,14 @@ def init_db():
             expires_days INTEGER,
             created_at TIMESTAMP DEFAULT NOW()
         );
+        CREATE TABLE IF NOT EXISTS tavily_cache (
+            id SERIAL PRIMARY KEY,
+            cache_key VARCHAR(255) UNIQUE NOT NULL,
+            result TEXT NOT NULL,
+            created_at TIMESTAMP DEFAULT NOW()
+        );
+        CREATE INDEX IF NOT EXISTS idx_tavily_cache_key ON tavily_cache(cache_key);
+        CREATE INDEX IF NOT EXISTS idx_tavily_cache_time ON tavily_cache(created_at DESC);
         CREATE INDEX IF NOT EXISTS idx_articles_status ON articles(status);
         CREATE INDEX IF NOT EXISTS idx_articles_category ON articles(category);
         CREATE INDEX IF NOT EXISTS idx_articles_created ON articles(created_at DESC);
@@ -569,20 +577,120 @@ def deduplicate_topics(topics: List[dict]) -> List[dict]:
 
     return unique
 
+# ── TAVILY CACHE ──
+TAVILY_CACHE_TTL_HOURS = 6  # Cache results for 6 hours
+
+def get_tavily_cache(cache_key: str) -> Optional[str]:
+    """Get cached Tavily result if still fresh."""
+    try:
+        conn = get_db()
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT result FROM tavily_cache
+            WHERE cache_key=%s
+            AND created_at > NOW() - INTERVAL '%s hours'
+        """, (cache_key, TAVILY_CACHE_TTL_HOURS))
+        row = cur.fetchone()
+        cur.close()
+        conn.close()
+        if row:
+            logger.info(f"Tavily cache HIT: {cache_key[:50]}")
+            return row["result"]
+    except Exception as e:
+        logger.error(f"Cache get error: {e}")
+    return None
+
+def set_tavily_cache(cache_key: str, result: str):
+    """Store Tavily result in cache."""
+    try:
+        conn = get_db()
+        cur = conn.cursor()
+        cur.execute("""
+            INSERT INTO tavily_cache (cache_key, result)
+            VALUES (%s, %s)
+            ON CONFLICT (cache_key) DO UPDATE
+            SET result=%s, created_at=NOW()
+        """, (cache_key, result, result))
+        conn.commit()
+        cur.close()
+        conn.close()
+    except Exception as e:
+        logger.error(f"Cache set error: {e}")
+
+def clear_tavily_cache():
+    """Clear expired cache entries."""
+    try:
+        conn = get_db()
+        cur = conn.cursor()
+        cur.execute("DELETE FROM tavily_cache WHERE created_at < NOW() - INTERVAL '12 hours'")
+        conn.commit()
+        cur.close()
+        conn.close()
+    except Exception as e:
+        logger.error(f"Cache clear error: {e}")
+
+# ── CATEGORY ROTATION ──
+# Run 4 categories per pipeline run, rotating through all 7
+ALL_CATEGORIES_ORDERED = ["news", "football", "finance", "entertainment", "tech", "health", "education"]
+
+def get_categories_for_run() -> List[str]:
+    """
+    Return 4 categories for this pipeline run.
+    Rotates through all 7 so every category gets covered over 2 runs.
+    """
+    try:
+        conn = get_db()
+        cur = conn.cursor()
+        # Track which categories ran last using tavily_cache with special key
+        cur.execute("SELECT result FROM tavily_cache WHERE cache_key='_category_rotation'")
+        row = cur.fetchone()
+        cur.close()
+        conn.close()
+        if row:
+            last_index = int(row["result"])
+        else:
+            last_index = -1
+    except:
+        last_index = -1
+
+    # Pick next 4 categories starting from where we left off
+    n = len(ALL_CATEGORIES_ORDERED)
+    start = (last_index + 1) % n
+    selected = []
+    for i in range(4):
+        selected.append(ALL_CATEGORIES_ORDERED[(start + i) % n])
+
+    # Save rotation position
+    set_tavily_cache("_category_rotation", str((start + 3) % n))
+    return selected
+
 async def fetch_topics_from_tavily(category: str, queries) -> List[dict]:
     """
     Discover real trending topics using Tavily.
-    Accepts single query string or list of queries.
-    Extracts actual news headlines from content — not website page titles.
+    Uses 6-hour cache to save API calls.
+    Only returns results from last 48 hours.
     """
     if not TAVILY_API_KEY:
         return []
 
-    query_list = [queries] if isinstance(queries, str) else queries[:2]
+    import json as _json
+    query_list = [queries] if isinstance(queries, str) else queries[:1]
     topics = []
     seen = set()
 
     for query in query_list:
+        # Check cache first — saves API calls
+        cache_key = f"topics_{category}_{query[:80]}"
+        cached = get_tavily_cache(cache_key)
+        if cached:
+            try:
+                cached_topics = _json.loads(cached)
+                topics.extend(cached_topics)
+                logger.info(f"Cache hit [{category}]: {len(cached_topics)} topics")
+                continue
+            except:
+                pass
+
         try:
             async with httpx.AsyncClient(timeout=15) as client:
                 r = await client.post(
@@ -591,7 +699,7 @@ async def fetch_topics_from_tavily(category: str, queries) -> List[dict]:
                         "api_key": TAVILY_API_KEY,
                         "query": query,
                         "search_depth": "basic",
-                        "max_results": 6,
+                        "max_results": 5,
                         "include_answer": False,
                         "sort_by": "date",
                     }
@@ -599,32 +707,29 @@ async def fetch_topics_from_tavily(category: str, queries) -> List[dict]:
                 if r.status_code != 200:
                     continue
 
+                new_topics = []
                 for res in r.json().get("results", []):
                     page_title = res.get("title", "").strip()
                     content = res.get("content", "").strip()
                     url = res.get("url", "")
                     pub_date = res.get("published_date", "") or ""
 
-                    # Skip results older than 14 days
+                    # 48-hour filter — trending topics must be fresh
                     if pub_date:
                         try:
                             pub_dt = datetime.fromisoformat(pub_date.replace("Z", "+00:00"))
-                            age_days = (datetime.now(timezone.utc) - pub_dt).days
-                            if age_days > 14:
-                                logger.info(f"Skipping old result ({age_days}d old): {page_title[:50]}")
+                            age_hours = (datetime.now(timezone.utc) - pub_dt).total_seconds() / 3600
+                            if age_hours > 48:
+                                logger.info(f"Skipping ({age_hours:.0f}h old): {page_title[:40]}")
                                 continue
                         except Exception:
                             pass
-
-                    # Extra check: reject if content clearly references old years
-                    content_lower = content.lower()
-                    title_lower = page_title.lower()
-                    current_year = datetime.now().year
-                    old_years = [str(y) for y in range(2020, current_year - 1)]
-                    # If title contains an old year explicitly (e.g. "May 2024"), skip
-                    for old_year in old_years:
-                        if f" {old_year}" in title_lower or f"({old_year})" in title_lower:
-                            logger.info(f"Skipping old-year result ({old_year}): {page_title[:50]}")
+                    else:
+                        # No date — reject if old year in title
+                        current_year = datetime.now().year
+                        old_years = [str(y) for y in range(2020, current_year - 1)]
+                        title_lower = page_title.lower()
+                        if any(f" {y}" in title_lower or f"({y})" in title_lower for y in old_years):
                             continue
 
                     skip_domains = ["google.com","bing.com","yahoo.com","reddit.com",
@@ -643,34 +748,36 @@ async def fetch_topics_from_tavily(category: str, queries) -> List[dict]:
                         continue
                     seen.add(h_lower)
 
-                    # Classify — if result clearly belongs to different category, use that
                     detected_cat = classify_topic(headline)
-                    # Only use detected_cat if it's confident, otherwise use search category
                     final_cat = detected_cat if detected_cat else category
 
-                    # Skip if misclassified as football with no football keywords
                     if final_cat == "football" and category != "football":
                         if not any(kw in headline.lower() for kw in ["football","soccer","goal","match","premier","league","afcon","fifa","ucl"]):
                             final_cat = category
 
-                    topics.append({
+                    new_topics.append({
                         "topic": headline,
                         "category": final_cat,
                         "source": "tavily_discovery",
                         "context": content[:600]
                     })
 
+                # Cache results for 6 hours
+                if new_topics:
+                    set_tavily_cache(cache_key, _json.dumps(new_topics))
+                    topics.extend(new_topics)
+                    logger.info(f"Tavily API [{category}]: {len(new_topics)} fresh topics cached")
+
         except Exception as e:
             logger.error(f"Tavily error [{category}] '{query[:30]}': {e}")
 
-    logger.info(f"Tavily [{category}]: {len(topics)} headlines from {len(query_list)} queries")
     return topics
 
 async def fetch_nigeria_trends() -> List[dict]:
     """
     Discover trending Nigerian topics using Tavily.
-    Searches across all 7 categories concurrently.
-    Deduplicates similar stories before returning.
+    Rotates through 4 of 7 categories per run to save API calls.
+    Uses 6-hour cache — same results reused across multiple runs.
     """
     all_topics = []
     seen_topics = set()
@@ -683,10 +790,15 @@ async def fetch_nigeria_trends() -> List[dict]:
         seen_topics.add(t_lower)
         all_topics.append(topic_dict)
 
-    # Run all category searches concurrently
+    # Get 4 categories for this run (rotates through all 7)
+    run_categories = get_categories_for_run()
+    logger.info(f"This run covers categories: {run_categories}")
+
+    # Run selected category searches concurrently
     tasks = [
-        fetch_topics_from_tavily(cat, query)
-        for cat, query in CATEGORY_TREND_QUERIES.items()
+        fetch_topics_from_tavily(cat, CATEGORY_TREND_QUERIES[cat])
+        for cat in run_categories
+        if cat in CATEGORY_TREND_QUERIES
     ]
     results = await asyncio.gather(*tasks, return_exceptions=True)
 
@@ -695,7 +807,7 @@ async def fetch_nigeria_trends() -> List[dict]:
             for t in cat_topics:
                 add_topic(t)
 
-    # Bonus: Google Trends RSS if available
+    # Bonus: Google Trends RSS if available (free, no quota impact)
     try:
         async with httpx.AsyncClient(timeout=8) as client:
             r = await client.get(
@@ -714,7 +826,8 @@ async def fetch_nigeria_trends() -> List[dict]:
                     if pubdate_el is not None and pubdate_el.text:
                         try:
                             pub_dt = parsedate_to_datetime(pubdate_el.text)
-                            if (now - pub_dt).total_seconds() / 3600 > 24:
+                            age_hours = (now - pub_dt).total_seconds() / 3600
+                            if age_hours > 48:
                                 continue
                         except Exception:
                             pass
@@ -727,7 +840,9 @@ async def fetch_nigeria_trends() -> List[dict]:
     # Deduplicate similar stories
     all_topics = deduplicate_topics(all_topics)
 
-    # Log breakdown
+    # Clean expired cache entries
+    clear_tavily_cache()
+
     cat_counts = {}
     for t in all_topics:
         cat_counts[t["category"]] = cat_counts.get(t["category"], 0) + 1
@@ -772,9 +887,16 @@ def build_search_query(topic: str, category: str) -> str:
 async def fetch_news_context(topic: str, category: str = "news") -> str:
     """
     Fetch real current news using Tavily — live Google search results.
-    Falls back to GNews/NewsAPI if Tavily not available.
+    Uses 6-hour cache to save API calls.
     """
+    import json as _json
     query = build_search_query(topic, category)
+    cache_key = f"context_{query[:100]}"
+
+    # Check cache first
+    cached = get_tavily_cache(cache_key)
+    if cached:
+        return cached
 
     # ── Tavily (primary) ──
     if TAVILY_API_KEY:
@@ -786,24 +908,20 @@ async def fetch_news_context(topic: str, category: str = "news") -> str:
                         "api_key": TAVILY_API_KEY,
                         "query": query,
                         "search_depth": "basic",
-                        "max_results": 5,
+                        "max_results": 4,
                         "include_answer": True,
                         "include_raw_content": False,
-                        "sort_by": "date",  # Most recent first
+                        "sort_by": "date",
                     }
                 )
                 if r.status_code == 200:
                     data = r.json()
                     parts = []
-
-                    # Include Tavily's auto-generated answer summary
                     answer = data.get("answer", "")
                     if answer:
                         parts.append(f"CURRENT SUMMARY (most accurate): {answer}")
-
-                    # Include individual search results with publication dates
                     results = data.get("results", [])
-                    for res in results[:5]:
+                    for res in results[:4]:
                         title = res.get("title", "")
                         url = res.get("url", "")
                         content = res.get("content", "")[:400]
@@ -811,10 +929,11 @@ async def fetch_news_context(topic: str, category: str = "news") -> str:
                         if title:
                             date_note = f"Published: {pub_date}" if pub_date else "Date: unknown"
                             parts.append(f"Source: {title}\n{date_note}\nURL: {url}\nContent: {content}")
-
                     if parts:
-                        logger.info(f"Tavily: {len(results)} results for '{query}'")
-                        return "\n\n".join(parts)
+                        result = "\n\n".join(parts)
+                        set_tavily_cache(cache_key, result)
+                        logger.info(f"Tavily context: {len(results)} results for '{query[:40]}'")
+                        return result
         except Exception as e:
             logger.error(f"Tavily error: {e}")
 
