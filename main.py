@@ -1724,7 +1724,8 @@ async def generate_article(topic: str, category: str, real_data: str = "", is_ev
             "\n- SCORES RULE: Use ONLY the score from 'AUTHORITATIVE MATCH DATA'. NEVER fabricate a scoreline"
             "\n- WINNER RULE: Data clearly states WINNER — use that exactly, never swap teams"
             "\n- GOALSCORERS RULE: Only name goalscorers if they appear in the data. If data says 'Not available — do NOT fabricate names', write the article without naming scorers"
-            "\n- LIVE MATCH RULE: If no COMPLETED match data exists, the match may be live or upcoming. Write a PREVIEW only — NEVER guess or fabricate a final result"
+            "\n- LIVE MATCH RULE: If no COMPLETED match data exists with a final score, the match is UPCOMING or IN PROGRESS. Write a PREVIEW article only — NEVER guess, invent, or fabricate a final result under any circumstances"
+            "\n- COMPLETED MATCH requires: explicit final score + 'Full Time' or 'FT' status in the data. Anything else = write preview"
             "\n- COMPLETED MATCH: Write PAST TENSE — scoreline, goalscorers (only if in data), player ratings, key moments, Nigerian angle"
             "\n- UPCOMING MATCH: Write FUTURE TENSE preview — team form (use W/L/D data), H2H record, key players, prediction, Nigerian angle"
             "\n- PRE-MATCH structure: Introduction → Team Form → Head to Head → Key Players → Prediction → Nigerian Angle"
@@ -1914,6 +1915,8 @@ Return ONLY this JSON — no markdown, no explanation, no preamble:
     raise Exception("All AI APIs failed")
 
 # ── TELEGRAM ──
+# Edit sessions: tracks which admin is editing which article
+edit_sessions: dict = {}
 async def send_to_all_admins(text: str, reply_markup: dict = None):
     for chat_id in get_all_admins():
         await send_telegram(chat_id, text, reply_markup)
@@ -1937,17 +1940,25 @@ async def send_telegram(chat_id: int, text: str, reply_markup: dict = None, pars
 async def send_article_for_approval(article_id: int, title: str, excerpt: str, category: str, topic: str):
     if category == "uncategorized":
         cat_display = "⚠️ UNCATEGORIZED — Assign category before approving"
-        markup = {"inline_keyboard": [[
-            {"text": "📂 Assign Category", "callback_data": f"changecat_{article_id}"},
-            {"text": "❌ Reject", "callback_data": f"reject_{article_id}"}
-        ]]}
+        markup = {"inline_keyboard": [
+            [
+                {"text": "📂 Assign Category", "callback_data": f"changecat_{article_id}"},
+                {"text": "✏️ Edit", "callback_data": f"edit_{article_id}"},
+                {"text": "❌ Reject", "callback_data": f"reject_{article_id}"}
+            ]
+        ]}
     else:
         cat_display = category.upper()
-        markup = {"inline_keyboard": [[
-            {"text": "✅ Approve", "callback_data": f"approve_{article_id}"},
-            {"text": "❌ Reject", "callback_data": f"reject_{article_id}"},
-            {"text": "📂 Change Category", "callback_data": f"changecat_{article_id}"}
-        ]]}
+        markup = {"inline_keyboard": [
+            [
+                {"text": "✅ Approve", "callback_data": f"approve_{article_id}"},
+                {"text": "❌ Reject", "callback_data": f"reject_{article_id}"}
+            ],
+            [
+                {"text": "✏️ Edit Article", "callback_data": f"edit_{article_id}"},
+                {"text": "📂 Change Category", "callback_data": f"changecat_{article_id}"}
+            ]
+        ]}
     text = (
         f"📰 <b>New Article Ready</b>\n\n"
         f"<b>Trending:</b> {topic}\n"
@@ -2584,6 +2595,18 @@ async def telegram_webhook(request: Request):
                 conn.close()
                 await send_to_all_admins(f"❌ Article #{article_id} rejected.")
 
+            elif cb_data.startswith("edit_"):
+                article_id = int(cb_data.split("_")[1])
+                # Store edit session
+                edit_sessions[str(cb["from"]["id"])] = article_id
+                await send_telegram(cb["from"]["id"],
+                    f"✏️ <b>Edit Article #{article_id}</b>\n\n"
+                    f"Send me your correction as a message. For example:\n\n"
+                    f"<i>Change 'during Democracy Day celebrations' to 'ahead of Democracy Day'</i>\n\n"
+                    f"Or:\n<i>The match score was 2-1 to Mexico, not 0-0</i>\n\n"
+                    f"Send /canceledit to cancel."
+                )
+
             elif cb_data.startswith("changecat_"):
                 article_id = int(cb_data.split("_")[1])
                 # Show category selection buttons
@@ -2699,7 +2722,87 @@ async def telegram_webhook(request: Request):
             chat_id = msg["chat"]["id"]
             user_id = msg["from"]["id"]
 
-            if text == "/start":
+            # ── EDIT SESSION HANDLER ──
+            # If admin is in an edit session, treat their message as an edit instruction
+            if str(user_id) in edit_sessions and not text.startswith("/"):
+                article_id = edit_sessions.pop(str(user_id))
+                correction = text.strip()
+                try:
+                    conn = get_db()
+                    cur = conn.cursor()
+                    cur.execute("SELECT title, body, excerpt, category FROM articles WHERE id=%s", (article_id,))
+                    row = cur.fetchone()
+                    cur.close()
+                    conn.close()
+
+                    if not row:
+                        await send_telegram(chat_id, f"❌ Article #{article_id} not found.")
+                    else:
+                        await send_telegram(chat_id, f"⚙️ Applying edit to article #{article_id}...")
+
+                        edit_prompt = f"""You are editing a news article. Apply the following correction precisely.
+
+CORRECTION INSTRUCTION: {correction}
+
+CURRENT TITLE: {row['title']}
+CURRENT EXCERPT: {row['excerpt']}
+CURRENT BODY: {row['body'][:2000]}
+
+Apply ONLY the requested correction. Keep everything else exactly the same.
+Return ONLY this JSON — no markdown, no preamble:
+{{
+  "title": "corrected or unchanged title",
+  "excerpt": "corrected or unchanged excerpt",
+  "body": "corrected or unchanged body HTML"
+}}"""
+
+                        # Use Claude Haiku to apply the edit
+                        import httpx as _httpx
+                        async with _httpx.AsyncClient(timeout=30) as client:
+                            r = await client.post(
+                                "https://api.anthropic.com/v1/messages",
+                                headers={"x-api-key": ANTHROPIC_API_KEY, "anthropic-version": "2023-06-01", "content-type": "application/json"},
+                                json={"model": "claude-haiku-4-5-20251001", "max_tokens": 2500, "messages": [{"role": "user", "content": edit_prompt}]}
+                            )
+                            data = r.json()
+                            edited_text = data["content"][0]["text"].strip()
+                            edited_text = edited_text.replace("```json","").replace("```","").strip()
+                            import re as _re
+                            match = _re.search(r'\{.*\}', edited_text, _re.DOTALL)
+                            if match:
+                                import json as _json
+                                edited = _json.loads(match.group(0))
+                                conn = get_db()
+                                cur = conn.cursor()
+                                cur.execute("""
+                                    UPDATE articles SET title=%s, excerpt=%s, body=%s WHERE id=%s
+                                """, (edited.get("title", row["title"]),
+                                      edited.get("excerpt", row["excerpt"]),
+                                      edited.get("body", row["body"]),
+                                      article_id))
+                                conn.commit()
+                                cur.close()
+                                conn.close()
+                                await send_telegram(chat_id,
+                                    f"✅ <b>Article #{article_id} updated!</b>\n\n"
+                                    f"<b>New title:</b> {edited.get('title', row['title'])}\n\n"
+                                    f"You can now approve it with /approve {article_id}"
+                                )
+                            else:
+                                await send_telegram(chat_id, "❌ Edit failed — could not parse response. Try again.")
+                except Exception as e:
+                    await send_telegram(chat_id, f"❌ Edit error: {e}")
+                return {"ok": True}
+
+            elif text == "/canceledit":
+                if str(user_id) in edit_sessions:
+                    article_id = edit_sessions.pop(str(user_id))
+                    await send_telegram(chat_id, f"✅ Edit cancelled for article #{article_id}.")
+                else:
+                    await send_telegram(chat_id, "No active edit session.")
+                return {"ok": True}
+
+            elif text == "/start":
                 await send_telegram(chat_id, "👋 Welcome to <b>NaijaFlash Bot</b>!\n\nSend /help to see all commands.")
 
             elif text == "/help":
@@ -2841,7 +2944,25 @@ async def telegram_webhook(request: Request):
                 await send_telegram(chat_id, f"⚙️ Generating <b>{cat.upper()}</b> articles...")
                 asyncio.create_task(run_pipeline(cat))
 
-            elif text == "/pending":
+            elif text.startswith("/approve "):
+                if not is_admin(user_id):
+                    await send_telegram(chat_id, "⛔ Admins only.")
+                    return {"ok": True}
+                try:
+                    article_id = int(text.split()[1])
+                    conn = get_db()
+                    cur = conn.cursor()
+                    cur.execute("UPDATE articles SET status='published', published_at=NOW() WHERE id=%s RETURNING title, category", (article_id,))
+                    row = cur.fetchone()
+                    conn.commit()
+                    cur.close()
+                    conn.close()
+                    if row:
+                        await send_to_all_admins(f"✅ Article #{article_id} approved and published.\n<b>{row['title']}</b>")
+                    else:
+                        await send_telegram(chat_id, f"❌ Article #{article_id} not found.")
+                except Exception as e:
+                    await send_telegram(chat_id, f"❌ Error: {e}")
                 if not is_admin(user_id):
                     await send_telegram(chat_id, "⛔ Admins only.")
                     return {"ok": True}
