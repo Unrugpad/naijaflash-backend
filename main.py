@@ -1700,9 +1700,9 @@ def is_article_quality_ok(article: dict) -> tuple:
     excerpt = article.get("excerpt", "")
     body = article.get("body", "")
 
-    # Title too short
-    if len(title) < 15:
-        return False, f"Title too short: '{title}'"
+    # Title too short or lazy (e.g. "CBN Dollar Rate Today")
+    if len(title) < 30:
+        return False, f"Title too short/weak (under 30 chars): '{title}'"
 
     # Suspicious phrases indicating the AI itself had no data and is talking to us
     # (first-person AI admissions only — NOT normal journalistic caution like "not confirmed")
@@ -1871,7 +1871,7 @@ STRICT RULES — FOLLOW EXACTLY:
 
 Return ONLY this JSON — no markdown, no explanation, no preamble:
 {{
-  "title": "Compelling SEO headline, max 80 chars, includes main keyword",
+  "title": "Descriptive SEO headline, 40-80 chars, includes specific facts/numbers/names — NOT a vague label. BAD: 'CBN Dollar Rate Today'. GOOD: 'CBN Dollar Rate Hits ₦1,359 Today as Naira Holds Steady'",
   "excerpt": "2 clear sentences summarising the article for SEO and social sharing",
   "body": "Complete article HTML using only <p> <h2> <h3> <ul> <li> <strong> tags",
   "image_query": "3-word image search query"
@@ -2422,7 +2422,7 @@ async def run_pipeline(force_category: str = None):
             try:
                 conn = get_db()
                 cur = conn.cursor()
-                cur.execute("DELETE FROM tavily_cache WHERE cache_key LIKE 'topics_%'")
+                cur.execute("DELETE FROM tavily_cache WHERE cache_key LIKE 'topics_%' OR cache_key LIKE 'gt_content_%'")
                 conn.commit()
                 cur.close()
                 conn.close()
