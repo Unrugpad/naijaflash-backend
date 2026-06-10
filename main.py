@@ -1550,6 +1550,7 @@ async def generate_article(topic: str, category: str, real_data: str = "", is_ev
             "\n- OPPONENT RULE: Use EXACT team name — 'Northern Ireland' ≠ 'Republic of Ireland' ≠ 'Ireland'"
             "\n- VENUE RULE: Use exact venue from data — never guess or substitute a city"
             "\n- NIGERIA WORLD CUP: Nigeria did NOT qualify for the 2026 World Cup — never write about Nigeria preparing for or playing in it"
+            "\n- 2026 CHAMPIONS LEAGUE FINAL FACT: PSG beat Arsenal 1-1 (4-3 on penalties) on May 30, 2026 in Budapest. Havertz scored for Arsenal (6'), Dembélé penalty for PSG. PSG won back-to-back titles"
             "\n- Write descriptive headline — not just team names"
             "\n- Always include Nigerian angle — Super Eagles, Nigerian players, Nigerian fans"
         )
@@ -1958,18 +1959,43 @@ async def run_pipeline(force_category: str = None):
         if force_category:
             cat_trends = [t for t in trends if t["category"] == force_category]
             new_cat_trends = [t for t in cat_trends if not is_topic_used(t["topic"])]
-            selected = new_cat_trends[:2]
+
+            # Deduplicate within results
+            seen_in_run = set()
+            deduped = []
+            for t in new_cat_trends:
+                t_lower = t["topic"].lower()
+                t_words = set(w for w in re.findall(r'\b\w{5,}\b', t_lower) if w not in {"nigeria","nigerian","latest","news","today","2026"})
+                is_dup = any(
+                    len(t_words & set(w for w in re.findall(r'\b\w{5,}\b', s) if w not in {"nigeria","nigerian","latest","news","today","2026"})) >= 2
+                    for s in seen_in_run
+                )
+                if not is_dup:
+                    deduped.append(t)
+                    seen_in_run.add(t_lower)
+
+            selected = deduped[:2]
 
             # Fill to 2 with evergreen if needed
-            while len(selected) < 2:
+            attempts = 0
+            while len(selected) < 2 and attempts < 10:
+                attempts += 1
                 fallback = get_fallback_topic(force_category)
-                if not fallback or is_topic_used(fallback["topic"]):
+                if not fallback:
                     break
+                fb_lower = fallback["topic"].lower()
+                if is_topic_used(fallback["topic"]) or fb_lower in seen_in_run:
+                    continue
                 selected.append(fallback)
+                seen_in_run.add(fb_lower)
 
             if not selected:
                 await send_to_all_admins(f"⚠️ No topics available for <b>{force_category.upper()}</b>.")
                 return
+
+            # Mark all as used immediately to prevent duplicates
+            for t in selected:
+                mark_topic_used(t["topic"])
 
             evergreen_count = sum(1 for t in selected if t.get("source") == "evergreen")
             trending_count = len(selected) - evergreen_count
@@ -1978,34 +2004,63 @@ async def run_pipeline(force_category: str = None):
                 status += f" ({trending_count} trending + {evergreen_count} evergreen)"
             await send_to_all_admins(status)
         else:
-            # All categories — pick max 2 topics per category
+            # All categories — pick max 2 topics per category, strictly deduplicated
             new_trends = [t for t in trends if not is_topic_used(t["topic"])]
             selected = []
             seen_cats = {}
+            seen_topics_this_run = set()  # Track topics within this run to prevent duplicates
 
             if new_trends:
-                # First pass: pick up to 2 trending topics per category
                 for t in new_trends:
                     cat = t["category"]
+                    topic_lower = t["topic"].lower()
+
+                    # Skip if similar topic already selected this run
+                    is_dup = False
+                    for seen in seen_topics_this_run:
+                        # Check keyword overlap
+                        t_words = set(w for w in re.findall(r'\b\w{5,}\b', topic_lower) if w not in {"nigeria","nigerian","latest","news","today","2026"})
+                        s_words = set(w for w in re.findall(r'\b\w{5,}\b', seen) if w not in {"nigeria","nigerian","latest","news","today","2026"})
+                        if len(t_words & s_words) >= 2:
+                            is_dup = True
+                            break
+
+                    if is_dup:
+                        continue
+
                     seen_cats[cat] = seen_cats.get(cat, 0)
                     if seen_cats[cat] < 2:
                         selected.append(t)
                         seen_cats[cat] += 1
+                        seen_topics_this_run.add(topic_lower)
 
             # Second pass: fill any category with < 2 articles using evergreen
             run_cats = get_categories_for_run()
             for cat in run_cats:
                 current_count = seen_cats.get(cat, 0)
                 needed = 2 - current_count
-                for _ in range(needed):
+                attempts = 0
+                while needed > 0 and attempts < 10:
+                    attempts += 1
                     fallback = get_fallback_topic(cat)
-                    if fallback and not is_topic_used(fallback["topic"]):
-                        selected.append(fallback)
-                        seen_cats[cat] = seen_cats.get(cat, 0) + 1
+                    if not fallback:
+                        break
+                    topic_lower = fallback["topic"].lower()
+                    # Skip if already used or similar to selected topics
+                    if is_topic_used(fallback["topic"]) or topic_lower in seen_topics_this_run:
+                        continue
+                    selected.append(fallback)
+                    seen_cats[cat] = seen_cats.get(cat, 0) + 1
+                    seen_topics_this_run.add(topic_lower)
+                    needed -= 1
 
             if not selected:
                 await send_to_all_admins("ℹ️ All topics already covered. Try /reset to start fresh.")
                 return
+
+            # Mark all selected topics as used immediately to prevent duplicates
+            for t in selected:
+                mark_topic_used(t["topic"])
 
             # Send ONE combined status message
             cats_found = list({t["category"] for t in selected})
@@ -2019,8 +2074,19 @@ async def run_pipeline(force_category: str = None):
             topic = trend["topic"]
             category = trend["category"]
             is_evergreen = trend.get("source") == "evergreen"
-            # Context from Tavily discovery — pre-fetched news snippet
             tavily_context = trend.get("context", "")
+
+            # Auto-correct obvious misclassifications
+            topic_lower = topic.lower()
+            if category == "tech" and any(w in topic_lower for w in ["ncdc","ebola","health","disease","hospital","doctor","nurse","malaria","cholera","lassa"]):
+                category = "health"
+                logger.info(f"Auto-corrected category: tech -> health for '{topic[:50]}'")
+            elif category == "entertainment" and any(w in topic_lower for w in ["ncdc","tinubu","senate","court","police","army","efcc","minister","governor"]):
+                category = "news"
+                logger.info(f"Auto-corrected category: entertainment -> news for '{topic[:50]}'")
+            elif category == "football" and any(w in topic_lower for w in ["naira","dollar","cbn","inflation","interest rate","budget","stock","shares","seplat"]):
+                category = "finance"
+                logger.info(f"Auto-corrected category: football -> finance for '{topic[:50]}'")
 
             try:
                 logger.info(f"Processing [{category}]{'[evergreen]' if is_evergreen else '[trending]'}: {topic[:60]}")
