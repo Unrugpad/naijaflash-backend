@@ -858,12 +858,10 @@ async def fetch_topics_from_tavily(category: str, queries) -> List[dict]:
 
 async def fetch_nigeria_trends(run_categories: List[str]) -> List[dict]:
     """
-    NEW SYSTEM:
-    1. Google Trends RSS → finds what Nigerians are searching RIGHT NOW (free)
-    2. Classify each trend into a category
-    3. Tavily → fetches actual news content for each trending topic (paid, surgical)
-    
-    This ensures topics are always fresh and relevant.
+    Discovery system:
+    1. Tavily category searches — primary, reliable, works from Railway
+    2. Google Trends RSS — bonus on top if available (often 403 from server IPs)
+    Topics are NOT marked used here — only marked used when selected for generation.
     """
     all_topics = []
     seen_topics = set()
@@ -878,10 +876,24 @@ async def fetch_nigeria_trends(run_categories: List[str]) -> List[dict]:
         seen_topics.add(t_lower)
         all_topics.append(topic_dict)
 
-    # ── STEP 1: Google Trends RSS — free, always current ──
-    google_trends_topics = []
+    # ── STEP 1: Tavily category searches — primary discovery ──
+    import json as _json
+    tasks = [
+        fetch_topics_from_tavily(cat, CATEGORY_TREND_QUERIES[cat])
+        for cat in run_categories
+        if cat in CATEGORY_TREND_QUERIES
+    ]
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+    for cat_topics in results:
+        if isinstance(cat_topics, list):
+            for t in cat_topics:
+                add_topic(t)
+
+    logger.info(f"Tavily discovery: {len(all_topics)} topics across {len(run_categories)} categories")
+
+    # ── STEP 2: Google Trends RSS — bonus topics (silent fail if 403) ──
     try:
-        async with httpx.AsyncClient(timeout=10) as client:
+        async with httpx.AsyncClient(timeout=8) as client:
             r = await client.get(
                 "https://trends.google.com/trending/rss?geo=NG",
                 headers={"User-Agent": "Mozilla/5.0 (compatible; NaijaFlash/1.0)"}
@@ -889,63 +901,36 @@ async def fetch_nigeria_trends(run_categories: List[str]) -> List[dict]:
             if r.status_code == 200:
                 root = ET.fromstring(r.text)
                 now = datetime.now(timezone.utc)
+                bonus = 0
                 for item in root.findall(".//item"):
                     title_el = item.find("title")
                     pubdate_el = item.find("pubDate")
-                    traffic_el = item.find("{https://trends.google.com/trending/rss}approx_traffic")
-
                     if title_el is None or not title_el.text:
                         continue
-
                     topic = title_el.text.strip()
-
-                    # Skip if it's a website name or too short
                     if is_website_name(topic) or len(topic) < 5:
                         continue
-
-                    # Check age — skip if older than 48 hours
                     if pubdate_el is not None and pubdate_el.text:
                         try:
                             pub_dt = parsedate_to_datetime(pubdate_el.text)
-                            age_hours = (now - pub_dt).total_seconds() / 3600
-                            if age_hours > 48:
+                            if (now - pub_dt).total_seconds() / 3600 > 48:
                                 continue
                         except Exception:
                             pass
+                    cat = classify_topic(topic) or "uncategorized"
+                    add_topic({"topic": topic, "category": cat, "source": "google_trends", "context": ""})
+                    bonus += 1
+                logger.info(f"Google Trends bonus: {bonus} extra topics")
+    except Exception:
+        pass  # 403 or timeout — silent fail, Tavily already has topics
 
-                    # Classify the topic
-                    cat = classify_topic(topic)
-                    if not cat:
-                        cat = "uncategorized"
-
-                    # Only include categories we're running this time
-                    # (uncategorized always included)
-                    if cat not in run_categories and cat != "uncategorized":
-                        continue
-
-                    traffic = traffic_el.text if traffic_el is not None else "0"
-                    google_trends_topics.append({
-                        "topic": topic,
-                        "category": cat,
-                        "traffic": traffic,
-                        "source": "google_trends"
-                    })
-
-                logger.info(f"Google Trends: {len(google_trends_topics)} trending topics in Nigeria")
-    except Exception as e:
-        logger.warning(f"Google Trends RSS unavailable: {e}")
-
-    # ── STEP 2: Fetch Tavily content for each Google Trends topic ──
-    if google_trends_topics:
-        # Process top 10 trending topics (sorted by traffic if available)
-        top_trends = google_trends_topics[:12]
-
-        async def fetch_content_for_trend(trend: dict) -> Optional[dict]:
+    # ── STEP 3: Fetch Tavily content for Google Trends bonus topics ──
+    # Only for topics that came from Google Trends (no context yet)
+    gt_topics = [t for t in all_topics if t.get("source") == "google_trends" and not t.get("context")]
+    if gt_topics and TAVILY_API_KEY:
+        async def fetch_gt_content(trend: dict) -> Optional[dict]:
             topic = trend["topic"]
-            category = trend["category"] if trend["category"] != "uncategorized" else "news"
-
-            # Check cache first
-            import json as _json
+            cat = trend["category"] if trend["category"] != "uncategorized" else "news"
             cache_key = f"gt_content_{topic[:80]}"
             cached = get_tavily_cache(cache_key)
             if cached:
@@ -953,16 +938,13 @@ async def fetch_nigeria_trends(run_categories: List[str]) -> List[dict]:
                     return _json.loads(cached)
                 except:
                     pass
-
-            # Build targeted search query
-            query = build_search_query(topic, category)
             try:
-                async with httpx.AsyncClient(timeout=15) as client:
+                async with httpx.AsyncClient(timeout=12) as client:
                     r = await client.post(
                         "https://api.tavily.com/search",
                         json={
                             "api_key": TAVILY_API_KEY,
-                            "query": query,
+                            "query": build_search_query(topic, cat),
                             "search_depth": "basic",
                             "max_results": 3,
                             "include_answer": True,
@@ -971,97 +953,32 @@ async def fetch_nigeria_trends(run_categories: List[str]) -> List[dict]:
                     )
                     if r.status_code != 200:
                         return None
-
                     data = r.json()
-                    results = data.get("results", [])
-                    answer = data.get("answer", "")
-
-                    # Check freshness of results
-                    fetch_ts = datetime.now(timezone.utc).timestamp()
-                    fresh_results = []
-                    now_dt = datetime.now(timezone.utc)
-                    current_year = now_dt.year
-                    # Old-date patterns to catch undated stale articles
-                    old_year_patterns = [str(y) for y in range(2020, current_year)]
-                    for res in results:
-                        pub_date = res.get("published_date", "") or ""
-                        content_text = res.get("content", "") or ""
-                        title_text = res.get("title", "") or ""
-                        age_hours = 0
-                        if pub_date:
-                            try:
-                                pub_dt = datetime.fromisoformat(pub_date.replace("Z", "+00:00"))
-                                age_hours = (now_dt - pub_dt).total_seconds() / 3600
-                                if age_hours > 72:  # Allow up to 72 hours for context
-                                    continue
-                            except:
-                                pass
-                        else:
-                            # No pub_date — scan title for an explicit old year
-                            tl = title_text.lower()
-                            if any(f" {y}" in tl or f"({y})" in tl or f",{y}" in tl for y in old_year_patterns):
-                                logger.info(f"Skipping stale-dated source: {title_text[:40]}")
-                                continue
-                        fresh_results.append(res)
-
-                    if not fresh_results and not answer:
-                        return None
-
-                    # Build context from results
                     parts = []
-                    if answer:
-                        parts.append(f"SUMMARY: {answer}")
-                    for res in fresh_results[:3]:
-                        title = res.get("title", "")
-                        content = res.get("content", "")[:400]
-                        pub_date = res.get("published_date", "")
-                        url = res.get("url", "")
-                        if title:
-                            date_note = f"Published: {pub_date}" if pub_date else ""
-                            parts.append(f"Source: {title}\n{date_note}\nURL: {url}\nContent: {content}")
-
-                    context = "\n\n".join(parts)
-
-                    result = {
-                        **trend,
-                        "context": context,
-                        "fetched_at": fetch_ts
-                    }
-
-                    # Cache for 2 hours
-                    set_tavily_cache(cache_key, _json.dumps(result))
-                    return result
-
+                    if data.get("answer"):
+                        parts.append(f"SUMMARY: {data['answer']}")
+                    for res in data.get("results", [])[:3]:
+                        if res.get("title"):
+                            parts.append(f"Source: {res['title']}\nPublished: {res.get('published_date','')}\nContent: {res.get('content','')[:400]}")
+                    if parts:
+                        result = {**trend, "context": "\n\n".join(parts)}
+                        set_tavily_cache(cache_key, _json.dumps(result))
+                        return result
             except Exception as e:
-                logger.error(f"Tavily content fetch error for '{topic}': {e}")
-                return None
+                logger.error(f"GT content fetch error: {e}")
+            return None
 
-        # Fetch content for all trends concurrently
-        tasks = [fetch_content_for_trend(t) for t in top_trends]
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-
-        for result in results:
-            if result and isinstance(result, dict):
-                add_topic(result)
-
-    # ── STEP 3: Fallback — if Google Trends fails, use Tavily category search ──
-    if not all_topics:
-        logger.warning("Google Trends returned nothing — falling back to Tavily category search")
-        tasks = [
-            fetch_topics_from_tavily(cat, CATEGORY_TREND_QUERIES[cat])
-            for cat in run_categories
-            if cat in CATEGORY_TREND_QUERIES
-        ]
-        fallback_results = await asyncio.gather(*tasks, return_exceptions=True)
-        for cat_topics in fallback_results:
-            if isinstance(cat_topics, list):
-                for t in cat_topics:
-                    add_topic(t)
+        gt_results = await asyncio.gather(*[fetch_gt_content(t) for t in gt_topics[:8]], return_exceptions=True)
+        for res in gt_results:
+            if res and isinstance(res, dict):
+                # Update existing topic with context
+                for t in all_topics:
+                    if t["topic"] == res["topic"]:
+                        t["context"] = res.get("context", "")
+                        break
 
     # Deduplicate
     all_topics = deduplicate_topics(all_topics)
-
-    # Clean old cache
     clear_tavily_cache()
 
     cat_counts = {}
@@ -2415,20 +2332,9 @@ async def run_pipeline(force_category: str = None):
                 continue
 
         if generated == 0:
-            await send_to_all_admins("⚠️ Pipeline ran but failed to generate articles. Check Railway logs.")
+            await send_to_all_admins("⚠️ Pipeline ran but no articles generated. Check Railway logs.")
         else:
             logger.info(f"Pipeline {label} done. {generated} articles generated.")
-            # Clear topic-level Tavily cache so next run fetches fresh results
-            try:
-                conn = get_db()
-                cur = conn.cursor()
-                cur.execute("DELETE FROM tavily_cache WHERE cache_key LIKE 'topics_%' OR cache_key LIKE 'gt_content_%'")
-                conn.commit()
-                cur.close()
-                conn.close()
-                logger.info("Cleared topic cache after successful pipeline run")
-            except Exception as e:
-                logger.error(f"Cache clear error: {e}")
 
     except Exception as e:
         logger.error(f"Pipeline error: {e}")
