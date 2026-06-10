@@ -1993,36 +1993,37 @@ def get_fallback_topic(category: str) -> Optional[dict]:
 # ── MAIN PIPELINE ──
 async def run_pipeline(force_category: str = None):
     """
-    Pipeline with optional category filter.
-    Falls back to evergreen topics when nothing is trending for a category.
+    /generate → trending only, all 7 categories, ZERO evergreen fallback
+    /football, /news etc. → trending first, evergreen fallback if nothing trending
     """
     label = f"[{force_category.upper()}]" if force_category else "[ALL CATEGORIES]"
     logger.info(f"Pipeline {label} started")
     generated = 0
 
     try:
-        # Get rotation categories ONCE — used everywhere in this run
+        # Determine categories for this run
         if force_category:
             run_cats = [force_category]
         else:
-            run_cats = get_categories_for_run()
-            logger.info(f"This run covers: {run_cats}")
+            run_cats = CATEGORIES  # /generate searches ALL 7 categories
 
         trends = await fetch_nigeria_trends(run_cats)
 
-        # Filter by forced category if specified
         if force_category:
+            # ── CATEGORY SHORTCUT: trending first, evergreen fallback ──
             cat_trends = [t for t in trends if t["category"] == force_category]
             new_cat_trends = [t for t in cat_trends if not is_topic_used(t["topic"])]
 
-            # Deduplicate within results
+            # Deduplicate
             seen_in_run = set()
             deduped = []
             for t in new_cat_trends:
                 t_lower = t["topic"].lower()
-                t_words = set(w for w in re.findall(r'\b\w{5,}\b', t_lower) if w not in {"nigeria","nigerian","latest","news","today","2026"})
+                t_words = set(w for w in re.findall(r'\b\w{5,}\b', t_lower)
+                              if w not in {"nigeria","nigerian","latest","news","today","2026"})
                 is_dup = any(
-                    len(t_words & set(w for w in re.findall(r'\b\w{5,}\b', s) if w not in {"nigeria","nigerian","latest","news","today","2026"})) >= 2
+                    len(t_words & set(w for w in re.findall(r'\b\w{5,}\b', s)
+                                     if w not in {"nigeria","nigerian","latest","news","today","2026"})) >= 2
                     for s in seen_in_run
                 )
                 if not is_dup:
@@ -2031,7 +2032,7 @@ async def run_pipeline(force_category: str = None):
 
             selected = deduped[:2]
 
-            # Fill to 2 with evergreen if needed
+            # Fill to 2 with evergreen if needed (category shortcuts only)
             attempts = 0
             while len(selected) < 2 and attempts < 10:
                 attempts += 1
@@ -2045,10 +2046,13 @@ async def run_pipeline(force_category: str = None):
                 seen_in_run.add(fb_lower)
 
             if not selected:
-                await send_to_all_admins(f"⚠️ No topics available for <b>{force_category.upper()}</b>.")
+                await send_to_all_admins(
+                    f"ℹ️ No trending topics for <b>{force_category.upper()}</b> right now.\n"
+                    f"Try again later or run /reset to refresh topics."
+                )
                 return
 
-            # Mark all as used immediately to prevent duplicates
+            # Mark used immediately
             for t in selected:
                 mark_topic_used(t["topic"])
 
@@ -2056,71 +2060,57 @@ async def run_pipeline(force_category: str = None):
             trending_count = len(selected) - evergreen_count
             status = f"⚙️ Generating {len(selected)} <b>{force_category.upper()}</b> articles"
             if evergreen_count > 0:
-                status += f" ({trending_count} trending + {evergreen_count} evergreen)"
+                status += f" ({trending_count} trending + {evergreen_count} evergreen guide)"
             await send_to_all_admins(status)
+
         else:
-            # All categories — pick max 2 topics per category, strictly deduplicated
+            # ── /generate: TRENDING ONLY — zero evergreen ──
             new_trends = [t for t in trends if not is_topic_used(t["topic"])]
             selected = []
             seen_cats = {}
-            seen_topics_this_run = set()  # Track topics within this run to prevent duplicates
+            seen_topics_this_run = set()
 
-            if new_trends:
-                for t in new_trends:
-                    cat = t["category"]
-                    topic_lower = t["topic"].lower()
+            for t in new_trends:
+                cat = t["category"]
+                topic_lower = t["topic"].lower()
 
-                    # Skip if similar topic already selected this run
-                    is_dup = False
-                    for seen in seen_topics_this_run:
-                        # Check keyword overlap
-                        t_words = set(w for w in re.findall(r'\b\w{5,}\b', topic_lower) if w not in {"nigeria","nigerian","latest","news","today","2026"})
-                        s_words = set(w for w in re.findall(r'\b\w{5,}\b', seen) if w not in {"nigeria","nigerian","latest","news","today","2026"})
-                        if len(t_words & s_words) >= 2:
-                            is_dup = True
-                            break
-
-                    if is_dup:
-                        continue
-
-                    seen_cats[cat] = seen_cats.get(cat, 0)
-                    if seen_cats[cat] < 2:
-                        selected.append(t)
-                        seen_cats[cat] += 1
-                        seen_topics_this_run.add(topic_lower)
-
-            # Second pass: fill any category with < 2 articles using evergreen
-            for cat in run_cats:
-                current_count = seen_cats.get(cat, 0)
-                needed = 2 - current_count
-                attempts = 0
-                while needed > 0 and attempts < 10:
-                    attempts += 1
-                    fallback = get_fallback_topic(cat)
-                    if not fallback:
+                # Skip duplicates
+                is_dup = False
+                for seen in seen_topics_this_run:
+                    t_words = set(w for w in re.findall(r'\b\w{5,}\b', topic_lower)
+                                  if w not in {"nigeria","nigerian","latest","news","today","2026"})
+                    s_words = set(w for w in re.findall(r'\b\w{5,}\b', seen)
+                                  if w not in {"nigeria","nigerian","latest","news","today","2026"})
+                    if len(t_words & s_words) >= 2:
+                        is_dup = True
                         break
-                    topic_lower = fallback["topic"].lower()
-                    # Skip if already used or similar to selected topics
-                    if is_topic_used(fallback["topic"]) or topic_lower in seen_topics_this_run:
-                        continue
-                    selected.append(fallback)
-                    seen_cats[cat] = seen_cats.get(cat, 0) + 1
-                    seen_topics_this_run.add(topic_lower)
-                    needed -= 1
 
+                if is_dup:
+                    continue
+
+                seen_cats[cat] = seen_cats.get(cat, 0)
+                if seen_cats[cat] < 2:
+                    selected.append(t)
+                    seen_cats[cat] += 1
+                    seen_topics_this_run.add(topic_lower)
+
+            # NO evergreen fallback for /generate
             if not selected:
-                await send_to_all_admins("ℹ️ All topics already covered. Try /reset to start fresh.")
+                await send_to_all_admins(
+                    "ℹ️ No fresh trending topics found right now.\n"
+                    "Try again in a few hours, or use /health /education /finance for evergreen guides."
+                )
                 return
 
-            # Mark all selected topics as used immediately to prevent duplicates
+            # Mark used immediately
             for t in selected:
                 mark_topic_used(t["topic"])
 
-            # Send ONE combined status message
-            cats_found = list({t["category"] for t in selected})
-            cat_labels = " · ".join([c.upper() for c in sorted(cats_found)])
+            # Status: show only categories with actual trending content
+            cats_found = sorted({t["category"] for t in selected})
+            cat_labels = " · ".join([c.upper() for c in cats_found])
             await send_to_all_admins(
-                f"⚙️ Generating {len(selected)} articles across: {cat_labels}"
+                f"⚙️ Generating {len(selected)} trending articles across: {cat_labels}"
             )
 
         # Process selected topics
