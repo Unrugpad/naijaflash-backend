@@ -585,7 +585,7 @@ def deduplicate_topics(topics: List[dict]) -> List[dict]:
     return unique
 
 # ── TAVILY CACHE ──
-TAVILY_CACHE_TTL_HOURS = 6  # Cache results for 6 hours
+TAVILY_CACHE_TTL_HOURS = 2  # Cache results for 2 hours — keeps news fresh
 
 def get_tavily_cache(cache_key: str) -> Optional[str]:
     """Get cached Tavily result if still fresh."""
@@ -717,9 +717,14 @@ async def fetch_topics_from_tavily(category: str, queries) -> List[dict]:
         if cached:
             try:
                 cached_topics = _json.loads(cached)
-                topics.extend(cached_topics)
-                logger.info(f"Cache hit [{category}]: {len(cached_topics)} topics")
-                continue
+                # Re-filter cached results — remove any that slipped through
+                # We can't re-check pub_date from cache so just use them
+                # but skip website names that might have been missed
+                valid = [t for t in cached_topics if not is_website_name(t.get("topic",""))]
+                if valid:
+                    topics.extend(valid)
+                    logger.info(f"Cache hit [{category}]: {len(valid)} topics")
+                    continue
             except:
                 pass
 
@@ -805,10 +810,10 @@ async def fetch_topics_from_tavily(category: str, queries) -> List[dict]:
 
     return topics
 
-async def fetch_nigeria_trends() -> List[dict]:
+async def fetch_nigeria_trends(run_categories: List[str]) -> List[dict]:
     """
     Discover trending Nigerian topics using Tavily.
-    Rotates through 4 of 7 categories per run to save API calls.
+    Only searches the categories passed in (from rotation).
     Uses 6-hour cache — same results reused across multiple runs.
     """
     all_topics = []
@@ -822,11 +827,9 @@ async def fetch_nigeria_trends() -> List[dict]:
         seen_topics.add(t_lower)
         all_topics.append(topic_dict)
 
-    # Get 4 categories for this run (rotates through all 7)
-    run_categories = get_categories_for_run()
-    logger.info(f"This run covers categories: {run_categories}")
+    logger.info(f"Fetching trends for categories: {run_categories}")
 
-    # Run selected category searches concurrently
+    # Only search the categories for this run
     tasks = [
         fetch_topics_from_tavily(cat, CATEGORY_TREND_QUERIES[cat])
         for cat in run_categories
@@ -1998,7 +2001,14 @@ async def run_pipeline(force_category: str = None):
     generated = 0
 
     try:
-        trends = await fetch_nigeria_trends()
+        # Get rotation categories ONCE — used everywhere in this run
+        if force_category:
+            run_cats = [force_category]
+        else:
+            run_cats = get_categories_for_run()
+            logger.info(f"This run covers: {run_cats}")
+
+        trends = await fetch_nigeria_trends(run_cats)
 
         # Filter by forced category if specified
         if force_category:
@@ -2080,7 +2090,6 @@ async def run_pipeline(force_category: str = None):
                         seen_topics_this_run.add(topic_lower)
 
             # Second pass: fill any category with < 2 articles using evergreen
-            run_cats = get_categories_for_run()
             for cat in run_cats:
                 current_count = seen_cats.get(cat, 0)
                 needed = 2 - current_count
