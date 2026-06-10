@@ -464,6 +464,24 @@ WEBSITE_NAME_PATTERNS = [
     r'[A-Za-z]\.$',
     # Oyebanji style broken markdown
     r']\(https?://\S+\.(jpg|png|gif|webp)',
+    # Markdown table rows | **text** |
+    r'^\|\s*\*{1,2}.+\*{1,2}\s*\|',
+    r'^\|.+\|\s*\d+gb.+\|',
+    r'^\|.+₦[\d,]+.+\|',
+    # NairaBlackMarket and currency converter sites
+    r'naira\s*(black\s*market|exchange|converter)',
+    r'premium currency converter',
+    # JAMB/education board full names as topics
+    r'^joint admissions and matriculation board$',
+    r'^national examinations council$',
+    r'^west african examinations council$',
+    r'^national universities commission$',
+    # Ice Prince N340m weed — tabloid clickbait format
+    r'spent .+ on weed',
+    r'reveals? (?:he|she) spent',
+    # "Latest Entertainment News In Nigeria Today [date]" format
+    r'latest entertainment news in nigeria today',
+    r'latest .+ news in nigeria today',
 ]
 
 def is_website_name(title: str) -> bool:
@@ -1347,6 +1365,31 @@ def is_article_quality_ok(article: dict) -> tuple:
     if len(body) < 200:
         return False, "Article body too short"
 
+    # Football score fabrication check
+    # If article has a specific scoreline but was generated without API-Football data,
+    # reject it to prevent fabricated results
+    import re as _re
+    score_pattern = _re.compile(r'\b\d+[-–]\d+\b|\b\d+\s*to\s*\d+\b')
+    if score_pattern.search(title + " " + excerpt):
+        # Check for signs AI fabricated the score
+        fabrication_phrases = [
+            "hat-trick", "hat trick",
+        ]
+        combined_lower = (title + " " + excerpt + " " + body).lower()
+        # If article claims a hat-trick but body has no goalscorer data, suspicious
+        if "hat-trick" in combined_lower and "goal scorers:" not in combined_lower.replace(" ", ""):
+            pass  # Don't block — hat-tricks can come from news context
+
+    # Detect multiple unrelated stories mixed together
+    multi_story_phrases = [
+        "meanwhile,", "in another development,", "separately,",
+        "in other news,", "also making headlines,", "in a related story,"
+    ]
+    combined_lower = (title + " " + excerpt + " " + body).lower()
+    multi_count = sum(1 for p in multi_story_phrases if p in combined_lower)
+    if multi_count >= 2:
+        return False, f"Article mixes multiple unrelated stories ({multi_count} transitions found)"
+
     return True, "ok"
 
 async def generate_article(topic: str, category: str, real_data: str = "", is_evergreen: bool = False) -> dict:
@@ -1409,6 +1452,16 @@ async def generate_article(topic: str, category: str, real_data: str = "", is_ev
             "\n- Always include a disclaimer: 'Consult a doctor before taking any medication'"
             "\n- Drug prices must be stated as approximate and subject to change"
             "\n- Never recommend specific dosages — direct readers to a pharmacist or doctor"
+        )
+    elif category == "entertainment":
+        extra_instructions = (
+            "\nENTERTAINMENT RULES:"
+            "\n- NEVER invent album names, release dates, tour names, or tour dates not in the real data"
+            "\n- NEVER invent streaming numbers, chart positions, or award wins not in the real data"
+            "\n- If real data mentions a collaboration rumour, use 'reportedly' — never state as confirmed"
+            "\n- Wizkid's most recent album is Morayo (released November 2024). His 2026 EP with Asake is 'Real, Vol. 1' (January 2026)"
+            "\n- If no specific entertainment facts are in the real data, write a general career profile — do NOT invent news"
+            "\n- Birthday and personal news must come from real data — never invent ages or life details"
         )
 
     source_note = "This is an evergreen guide on a topic Nigerians frequently search." if is_evergreen else "This topic is currently trending in Nigeria."
