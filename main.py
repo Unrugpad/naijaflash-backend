@@ -72,7 +72,18 @@ ENTERTAINMENT_KEYWORDS = [
     "bbnaija","big brother","afrobeats","singer","actor","actress","rapper","producer",
     "tiwa savage","yemi alade","patoranking","fireboy","omah lay","kizz daniel",
     "adekunle gold","simi","netflix","amazon prime","iroko tv","festival","tour",
-    "music video","collaboration","feature","remix","ep","playlist"
+    "music video","collaboration","feature","remix","ep","playlist",
+    # More Nigerian entertainers and celebrities
+    "tacha","mercy eke","nengi","phyna","laycon","whitemoney","angel smith",
+    "funke akindele","omotola","genevieve","rita dominic","ramsey nouah",
+    "pete edochie","charles awurum","zubby michael","ken erics",
+    "dbanj","2baba","2face","psquare","paul okoye","peter okoye","rudeboy",
+    "niniola","sarz","dj tunez","don jazzy","mavin","chocolate city",
+    "naira marley","mohbad","zinoleesky","bella shmurda","lil kesh",
+    "fashion week","lagos fashion","afro nation","homecoming","headline",
+    "streams","spotify","apple music","audiomack","boomplay","charts",
+    "birthday","clocks new age","celebrates","red carpet","interview",
+    "engagement","married","divorce","beef","drama","shade","called out"
 ]
 
 TECH_KEYWORDS = [
@@ -434,6 +445,25 @@ WEBSITE_NAME_PATTERNS = [
     r'\|\s+\d+(d|h|m)\s*$',
     # "Vision for" type titles — too vague
     r"^[A-Za-z']+['s]+\s+vision for",
+    # Markdown image/link syntax ](https://...)
+    r'\]\s*\(https?://',
+    # Product catalogue page titles with | and model numbers
+    r'spark \d+,\s*\d+,\s*\d+',
+    r'\|\s*spark \d+',
+    # YouTube/playlist ft. format
+    r'\bft\b.*(davido|wizkid|burna|asake|rema|tems)',
+    # ESPN/BBC results pages
+    r'[-–]\s*(espn|bbc|sky sports|goal\.com)\s*(\(uk\)|\(ng\))?$',
+    # "Latest on [topic]" website taglines
+    r'^latest on (nigerian|nigeria)',
+    # Get all/breaking/celebrity gossip taglines
+    r'get all the (breaking|latest)',
+    # Source attribution with days ago
+    r'\d+(d|h)\s*\.\s*$',
+    # Tacha/celebrity trailing period format
+    r'[A-Za-z]\.$',
+    # Oyebanji style broken markdown
+    r']\(https?://\S+\.(jpg|png|gif|webp)',
 ]
 
 def is_website_name(title: str) -> bool:
@@ -1331,20 +1361,20 @@ async def generate_article(topic: str, category: str, real_data: str = "", is_ev
     if category == "football":
         extra_instructions = (
             "\nFOOTBALL RULES:"
-            "\n- SCORES RULE: Use ONLY the score from 'AUTHORITATIVE MATCH DATA'. NEVER fabricate a scoreline."
+            "\n- SCORES RULE: Use ONLY the score from 'AUTHORITATIVE MATCH DATA'. NEVER fabricate a scoreline"
             "\n- WINNER RULE: Data clearly states WINNER — use that exactly, never swap teams"
-            "\n- GOALSCORERS RULE: Only name goalscorers if they appear in the data. If data says 'Not available — do NOT fabricate names', do NOT name any scorers"
-            "\n- COMPLETED MATCH: Write PAST TENSE match report — scoreline, goalscorers (only if in data), player ratings, key moments, Nigerian angle"
-            "\n- UPCOMING MATCH: Write FUTURE TENSE preview — team form (use the W/L/D data provided), head-to-head record, key players to watch, prediction, Nigerian angle"
-            "\n- PRE-MATCH article structure: Introduction → Team Form → Head to Head → Key Players → Prediction → Nigerian Angle"
-            "\n- POST-MATCH article structure: Introduction with result → Match Report → Player Ratings → Key Moments → Nigerian Angle"
-            "\n- TRANSFER RULE: Any unconfirmed transfer must use 'reportedly' or 'according to reports'"
-            "\n- Write a descriptive headline — not just team names. Example: 'Nigeria vs Portugal Preview: Super Eagles Form, H2H & Prediction'"
-            "\n- For player topics: WHY TRENDING is the main story angle, stats are supporting data"
-            "\n- Always include Nigerian angle — Super Eagles, Nigerian players, what it means for Nigerian fans"
-            "\n- VENUE RULE: Always use the exact venue from the data — never guess or substitute a different city"
-            "\n- OPPONENT RULE: Use the exact team name from data — 'Northern Ireland' and 'Republic of Ireland' are different teams"
-            "\n- FUTURE MATCH RULE: The 2026 FIFA World Cup starts June 11, 2026. NEVER write a result for any World Cup match unless data confirms it has been played"
+            "\n- GOALSCORERS RULE: Only name goalscorers if they appear in the data. If data says 'Not available — do NOT fabricate names', write the article without naming scorers"
+            "\n- LIVE MATCH RULE: If no COMPLETED match data exists, the match may be live or upcoming. Write a PREVIEW only — NEVER guess or fabricate a final result"
+            "\n- COMPLETED MATCH: Write PAST TENSE — scoreline, goalscorers (only if in data), player ratings, key moments, Nigerian angle"
+            "\n- UPCOMING MATCH: Write FUTURE TENSE preview — team form (use W/L/D data), H2H record, key players, prediction, Nigerian angle"
+            "\n- PRE-MATCH structure: Introduction → Team Form → Head to Head → Key Players → Prediction → Nigerian Angle"
+            "\n- POST-MATCH structure: Introduction with result → Match Report → Player Ratings → Key Moments → Nigerian Angle"
+            "\n- TRANSFER RULE: Any unconfirmed transfer must use 'reportedly' or 'according to reports' — NEVER state as fact"
+            "\n- OPPONENT RULE: Use EXACT team name — 'Northern Ireland' ≠ 'Republic of Ireland' ≠ 'Ireland'"
+            "\n- VENUE RULE: Use exact venue from data — never guess or substitute a city"
+            "\n- NIGERIA WORLD CUP: Nigeria did NOT qualify for the 2026 World Cup — never write about Nigeria preparing for or playing in it"
+            "\n- Write descriptive headline — not just team names"
+            "\n- Always include Nigerian angle — Super Eagles, Nigerian players, Nigerian fans"
         )
     elif category == "tech":
         extra_instructions = (
