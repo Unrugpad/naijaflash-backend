@@ -1760,6 +1760,7 @@ async def generate_article(topic: str, category: str, real_data: str = "", is_ev
             "\n- OPPONENT RULE: Use EXACT team name — 'Northern Ireland' ≠ 'Republic of Ireland' ≠ 'Ireland'"
             "\n- VENUE RULE: Use exact venue from data — never guess or substitute a city"
             "\n- NIGERIA WORLD CUP: Nigeria did NOT qualify for the 2026 World Cup — never write about Nigeria preparing for or playing in it"
+            "\n- NIGERIA COACH: Éric Chelle is the current Super Eagles head coach (NOT Gernot Rohr who was fired in 2021, NOT Jose Peseiro who left in 2024)"
             "\n- 2026 CHAMPIONS LEAGUE FINAL FACT: PSG beat Arsenal 1-1 (4-3 on penalties) on May 30, 2026 in Budapest. Havertz scored for Arsenal (6'), Dembélé penalty for PSG. PSG won back-to-back titles"
             "\n- Write descriptive headline — not just team names"
             "\n- Always include Nigerian angle — Super Eagles, Nigerian players, Nigerian fans"
@@ -2187,11 +2188,15 @@ async def run_single_topic(topic: str, chat_id: int):
     """
     Generate a single article from a manually added topic.
     Full football stats support — pre and post match.
+    If user includes a score in the topic (e.g. "2-1"), treat as confirmed result.
     """
     try:
         # Classify topic
         category = classify_topic(topic) or "news"
         is_match = bool(re.search(r'\bvs?\.?\b', topic.lower()) or ' v ' in topic.lower())
+
+        # Check if user provided a score in the topic — treated as confirmed result
+        user_provided_score = bool(re.search(r'\b\d+[-–]\d+\b', topic))
 
         await send_telegram(chat_id, f"📂 Classified as: <b>{category.upper()}</b>")
 
@@ -2202,42 +2207,52 @@ async def run_single_topic(topic: str, chat_id: int):
         if category == "football":
             _is_match = is_match
             if is_match:
-                await send_telegram(chat_id, "🔍 Fetching match data from API-Football...")
-                football_data = await fetch_football_data(topic)
-
-                if football_data and "COMPLETED MATCH" in football_data:
+                # If user gave us the score, skip API-Football entirely
+                if user_provided_score:
                     _confirmed_ft = True
-                    await send_telegram(chat_id, "✅ Completed match data found — writing match report")
+                    await send_telegram(chat_id, "✅ Score provided — writing match report")
                     news_context = await fetch_news_context(topic, "football")
-                    real_data = f"AUTHORITATIVE MATCH DATA:\n{football_data}"
-                    if news_context:
-                        real_data += f"\n\nNEWS CONTEXT:\n{news_context}"
-
-                elif football_data and "UPCOMING MATCH" in football_data:
-                    await send_telegram(chat_id, "📅 Match not yet played — writing preview with stats")
-                    # Fetch pre-match stats
-                    news_context = await fetch_news_context(topic, "football")
-                    safe_ctx = news_context or ""
-                    # Strip any score lines from context
-                    score_patterns = re.compile(r'\d+[-–]\d+|\bgoal\b|\bscored\b|\bfull.?time\b|\bFT\b', re.IGNORECASE)
-                    safe_lines = [l for l in safe_ctx.split('\n') if not score_patterns.search(l)]
                     real_data = (
-                        "⛔ THIS MATCH HAS NOT BEEN PLAYED YET — WRITE A PREVIEW ONLY.\n"
-                        f"MATCH DATA:\n{football_data}\n\n"
-                        f"BACKGROUND CONTEXT (no scores):\n{chr(10).join(safe_lines)}"
+                        f"USER-CONFIRMED RESULT: {topic}\n\n"
+                        f"Write a MATCH REPORT using the score provided in the topic.\n\n"
+                        f"NEWS CONTEXT:\n{news_context or ''}"
                     )
                 else:
-                    # No API data — fetch from news
-                    await send_telegram(chat_id, "ℹ️ No API-Football data — using news sources")
-                    news_context = await fetch_news_context(topic, "football")
-                    safe_lines = [l for l in (news_context or "").split('\n')
-                                  if not re.search(r'\d+[-–]\d+|\bscored\b|\bfull.?time\b', l, re.IGNORECASE)]
-                    real_data = (
-                        "⛔ NO CONFIRMED MATCH RESULT — WRITE A PREVIEW ONLY.\n\n"
-                        f"BACKGROUND CONTEXT:\n{chr(10).join(safe_lines)}"
-                    )
+                    await send_telegram(chat_id, "🔍 Fetching match data from API-Football...")
+                    football_data = await fetch_football_data(topic)
+
+                    if football_data and "COMPLETED MATCH" in football_data:
+                        _confirmed_ft = True
+                        await send_telegram(chat_id, "✅ Completed match data found — writing match report")
+                        news_context = await fetch_news_context(topic, "football")
+                        real_data = f"AUTHORITATIVE MATCH DATA:\n{football_data}"
+                        if news_context:
+                            real_data += f"\n\nNEWS CONTEXT:\n{news_context}"
+
+                    elif football_data and "UPCOMING MATCH" in football_data:
+                        await send_telegram(chat_id, "📅 Match not yet played — writing preview with stats")
+                        news_context = await fetch_news_context(topic, "football")
+                        safe_ctx = news_context or ""
+                        score_patt = re.compile(r'\d+[-–]\d+|\bscored\b|\bfull.?time\b|\bFT\b', re.IGNORECASE)
+                        safe_lines = [l for l in safe_ctx.split('\n') if not score_patt.search(l)]
+                        real_data = (
+                            "⛔ THIS MATCH HAS NOT BEEN PLAYED YET — WRITE A PREVIEW ONLY.\n"
+                            f"MATCH DATA:\n{football_data}\n\n"
+                            f"BACKGROUND CONTEXT (no scores):\n{chr(10).join(safe_lines)}"
+                        )
+                    else:
+                        # No API data — use news context as preview
+                        await send_telegram(chat_id, "ℹ️ No API-Football data — using news sources for preview")
+                        news_context = await fetch_news_context(topic, "football")
+                        safe_lines = [l for l in (news_context or "").split('\n')
+                                      if not re.search(r'\d+[-–]\d+|\bscored\b|\bfull.?time\b', l, re.IGNORECASE)]
+                        real_data = (
+                            "⛔ NO CONFIRMED MATCH RESULT — WRITE A PREVIEW ONLY.\n"
+                            "Include: team form, key players, competition context, prediction.\n\n"
+                            f"BACKGROUND CONTEXT:\n{chr(10).join(safe_lines)}"
+                        )
             else:
-                # Non-match football topic (transfer, player news, standings)
+                # Non-match football topic
                 football_data = await fetch_football_data(topic)
                 news_context = await fetch_news_context(topic, "football")
                 real_data = "\n\n".join(filter(None, [football_data, news_context]))
@@ -2263,11 +2278,11 @@ async def run_single_topic(topic: str, chat_id: int):
             await send_telegram(chat_id, f"⚠️ Quality check failed: {reason}\nTry /addtopic with a more specific version.")
             return
 
-        # Post-gen fabrication check for unconfirmed matches
+        # Post-gen fabrication check — skip if user provided score or API confirmed FT
         if _is_match and not _confirmed_ft:
             article_text = (article_data.get("title","") + " " + article_data.get("excerpt","")).lower()
             if re.search(r'\b\d+[-–]\d+\b', article_text) or any(w in article_text for w in ["beat ","defeated ","won the match"]):
-                await send_telegram(chat_id, f"⚠️ Article rejected — AI fabricated a match result for unconfirmed match. Try again after the match is played.")
+                await send_telegram(chat_id, f"⚠️ Article rejected — AI fabricated a match result. Add the score in your topic to confirm: e.g. 'Portugal vs Nigeria result 2-1'")
                 return
 
         # Save and send for approval
