@@ -3144,6 +3144,7 @@ Return ONLY this JSON — no markdown, no preamble:
                     "/pending — View all pending articles\n"
                     "/approve [id] — Approve and publish an article\n"
                     "/reject [id] — Reject an article (keeps in DB)\n"
+                    "/unpublish [id] — Take a published article off the frontend\n"
                     "/delete [id] — Permanently delete an article\n"
                     "/delete [id] — Delete an article by ID\n\n"
                     "<b>Sponsored Articles:</b>\n"
@@ -3362,6 +3363,36 @@ Return ONLY this JSON — no markdown, no preamble:
                         await send_telegram(chat_id, f"🗑️ Article #{article_id} permanently deleted.\n<i>{row['title'][:60]}</i>")
                     else:
                         await send_telegram(chat_id, f"❌ Article #{article_id} not found.")
+                except Exception as e:
+                    await send_telegram(chat_id, f"❌ Error: {e}")
+
+            elif text.startswith("/unpublish "):
+                if not is_admin(user_id):
+                    await send_telegram(chat_id, "⛔ Admins only.")
+                    return {"ok": True}
+                try:
+                    article_id = int(text.split()[1])
+                    conn = get_db()
+                    cur = conn.cursor()
+                    cur.execute("""
+                        UPDATE articles SET status='draft', published_at=NULL
+                        WHERE id=%s AND status='published'
+                        RETURNING title
+                    """, (article_id,))
+                    row = cur.fetchone()
+                    conn.commit()
+                    cur.close()
+                    conn.close()
+                    if row:
+                        await send_telegram(chat_id,
+                            f"⬇️ Article #{article_id} unpublished from frontend.\n"
+                            f"<i>{row['title'][:60]}</i>\n\n"
+                            f"Use /approve {article_id} to re-publish it."
+                        )
+                    else:
+                        await send_telegram(chat_id,
+                            f"❌ Article #{article_id} not found or not currently published."
+                        )
                 except Exception as e:
                     await send_telegram(chat_id, f"❌ Error: {e}")
 
