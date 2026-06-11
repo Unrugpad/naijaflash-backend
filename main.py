@@ -2771,6 +2771,19 @@ async def run_pipeline(force_category: str = None):
 async def startup():
     init_db()
     logger.info("NaijaFlash v4 started")
+    # Keep Railway alive — ping every 10 minutes to prevent sleep
+    asyncio.create_task(keep_alive())
+
+async def keep_alive():
+    """Ping the health endpoint every 10 minutes to prevent Railway from sleeping."""
+    while True:
+        await asyncio.sleep(600)  # 10 minutes
+        try:
+            async with httpx.AsyncClient(timeout=5) as client:
+                await client.get(f"https://web-production-e8759.up.railway.app/api/health")
+            logger.info("Keep-alive ping sent")
+        except Exception:
+            pass
 
 @app.get("/")
 async def root():
