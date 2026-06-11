@@ -1685,7 +1685,67 @@ def slugify(text: str) -> str:
     return text[:80] + '-' + str(int(datetime.now().timestamp()))[-6:]
 
 # ── AI WRITER ──
-def is_article_quality_ok(article: dict) -> tuple:
+def parse_article_json(text: str) -> dict:
+    """
+    Robust JSON parser for AI-generated articles.
+    Handles edge cases: truncated JSON, unescaped quotes in body, etc.
+    """
+    # Clean markdown fences
+    text = text.replace("```json", "").replace("```", "").strip()
+
+    # Try direct parse first
+    try:
+        return json.loads(text)
+    except Exception:
+        pass
+
+    # Try extracting JSON object
+    try:
+        match = re.search(r'\{.*\}', text, re.DOTALL)
+        if match:
+            return json.loads(match.group(0))
+    except Exception:
+        pass
+
+    # Manual extraction fallback for truncated JSON
+    # Extract each field individually using regex
+    try:
+        result = {}
+
+        title_m = re.search(r'"title"\s*:\s*"(.*?)"(?=\s*,|\s*\})', text, re.DOTALL)
+        if title_m:
+            result["title"] = title_m.group(1).replace('\\"', '"')
+
+        excerpt_m = re.search(r'"excerpt"\s*:\s*"(.*?)"(?=\s*,|\s*\})', text, re.DOTALL)
+        if excerpt_m:
+            result["excerpt"] = excerpt_m.group(1).replace('\\"', '"')
+
+        image_m = re.search(r'"image_query"\s*:\s*"(.*?)"', text, re.DOTALL)
+        if image_m:
+            result["image_query"] = image_m.group(1)
+
+        # Body is the hardest — extract everything between "body": " and the last </p>"
+        body_start = text.find('"body"')
+        if body_start != -1:
+            body_val_start = text.find('"', body_start + 6) + 1
+            # Find the last closing HTML tag or closing quote
+            last_p = text.rfind('</p>')
+            last_li = text.rfind('</li>')
+            last_h = text.rfind('</h2>')
+            end_pos = max(last_p, last_li, last_h)
+            if end_pos > body_val_start:
+                body = text[body_val_start:end_pos + 4]  # Include the closing tag
+                # Unescape
+                body = body.replace('\\"', '"').replace('\\n', '\n').replace('\\t', '\t')
+                result["body"] = body
+
+        if result.get("title") and result.get("body"):
+            logger.info("Used manual JSON extraction fallback")
+            return result
+    except Exception as e:
+        logger.error(f"Manual JSON extraction failed: {e}")
+
+    raise ValueError("Could not parse article JSON from AI response")
     """
     Basic quality check before sending to Telegram.
     Returns (ok: bool, reason: str)
@@ -1881,11 +1941,11 @@ STRICT RULES — FOLLOW EXACTLY:
 16. Nigerian context throughout — naira prices, local brands, Nigerian cities where relevant
 17. NEVER write phrases like "as of my knowledge" — if you don't have data, write general guidance
 
-Return ONLY this JSON — no markdown, no explanation, no preamble:
+Return ONLY this JSON — no markdown, no explanation, no preamble. Ensure the JSON is complete and valid. Do NOT truncate the body field:
 {{
   "title": "Descriptive SEO headline, 40-80 chars, includes specific facts/numbers/names — NOT a vague label. BAD: 'CBN Dollar Rate Today'. GOOD: 'CBN Dollar Rate Hits ₦1,359 Today as Naira Holds Steady'",
   "excerpt": "2 clear sentences summarising the article for SEO and social sharing",
-  "body": "Complete article HTML using only <p> <h2> <h3> <ul> <li> <strong> tags",
+  "body": "Complete article HTML using only <p> <h2> <h3> <ul> <li> <strong> tags. Never use double quotes inside HTML attributes. Use single quotes for any HTML attributes.",
   "image_query": "3-word image search query"
 }}"""
 
@@ -1909,11 +1969,8 @@ Return ONLY this JSON — no markdown, no explanation, no preamble:
                 data = r.json()
                 text = data["content"][0]["text"].strip()
                 text = text.replace("```json","").replace("```","").strip()
-                match = re.search(r'\{.*\}', text, re.DOTALL)
-                if match:
-                    text = match.group(0)
                 logger.info(f"Claude Haiku wrote article for: {topic[:50]}")
-                return json.loads(text)
+                return parse_article_json(text)
         except Exception as e:
             logger.error(f"Claude Haiku failed: {e} — falling back to Groq")
 
@@ -1929,11 +1986,8 @@ Return ONLY this JSON — no markdown, no explanation, no preamble:
             )
             text = response.choices[0].message.content.strip()
             text = text.replace("```json","").replace("```","").strip()
-            match = re.search(r'\{.*\}', text, re.DOTALL)
-            if match:
-                text = match.group(0)
             logger.info(f"Groq wrote article for: {topic[:50]}")
-            return json.loads(text)
+            return parse_article_json(text)
         except Exception as e:
             logger.error(f"Groq failed: {e}")
 
@@ -1957,10 +2011,7 @@ Return ONLY this JSON — no markdown, no explanation, no preamble:
                 data = r.json()
                 text = data["content"][0]["text"].strip()
                 text = text.replace("```json","").replace("```","").strip()
-                match = re.search(r'\{.*\}', text, re.DOTALL)
-                if match:
-                    text = match.group(0)
-                return json.loads(text)
+                return parse_article_json(text)
         except Exception as e:
             logger.error(f"Claude fallback failed: {e}")
 
@@ -3189,12 +3240,8 @@ Return ONLY this JSON — no markdown, no preamble:
                                         {"text": "📂 Category", "callback_data": f"changecat_{article_id}"}
                                     ]
                                 ]}
-                                await send_telegram(chat_id,
-                                    f"✅ <b>Article #{article_id} updated — review before approving:</b>\n\n"
-                                    f"📰 <b>Title:</b>\n{new_title}\n\n"
-                                    f"📝 <b>Excerpt:</b>\n{new_excerpt}",
-                                    reply_markup=review_markup
-                                )
+                                await send_telegram(chat_id, "⚙️ Sending full preview for review...")
+                                await send_article_for_approval(article_id, new_title, new_excerpt, new_category, f"edited-{article_id}")
                             else:
                                 await send_telegram(chat_id, "❌ Edit failed — could not parse response. Try again.")
                 except Exception as e:
