@@ -916,15 +916,28 @@ async def fetch_newsdata_topics(categories: List[str]) -> List[dict]:
                     if is_website_name(title):
                         continue
 
-                    # 48-hour freshness check
+                    # Strict 48-hour freshness check
                     if pub_date:
                         try:
-                            pub_dt = datetime.fromisoformat(pub_date.replace("Z", "+00:00"))
+                            # Handle both "2026-04-17 10:30:00" and ISO formats
+                            pub_date_clean = pub_date.replace(" ", "T").replace("Z", "+00:00")
+                            if "+" not in pub_date_clean and len(pub_date_clean) == 19:
+                                pub_date_clean += "+00:00"
+                            pub_dt = datetime.fromisoformat(pub_date_clean)
+                            if pub_dt.tzinfo is None:
+                                pub_dt = pub_dt.replace(tzinfo=timezone.utc)
                             age_hours = (now - pub_dt).total_seconds() / 3600
                             if age_hours > 48:
+                                logger.info(f"NewsData skipping ({age_hours:.0f}h old): {title[:40]}")
                                 continue
-                        except Exception:
-                            pass
+                        except Exception as e:
+                            # Can't parse date — skip to be safe
+                            logger.info(f"NewsData skipping (unparseable date '{pub_date}'): {title[:40]}")
+                            continue
+                    else:
+                        # No pub_date — skip (can't verify freshness)
+                        logger.info(f"NewsData skipping (no date): {title[:40]}")
+                        continue
 
                     # Skip if already seen
                     t_lower = title.lower()
@@ -1930,6 +1943,8 @@ Return ONLY this JSON — no markdown, no explanation, no preamble:
 # ── TELEGRAM ──
 # Edit sessions: tracks which admin is editing which article
 edit_sessions: dict = {}
+# AddTopics sessions: tracks which admin is waiting to send their topic list
+addtopics_sessions: set = set()
 async def send_to_all_admins(text: str, reply_markup: dict = None):
     for chat_id in get_all_admins():
         await send_telegram(chat_id, text, reply_markup)
@@ -2167,6 +2182,115 @@ def get_fallback_topic(category: str) -> Optional[dict]:
     except Exception as e:
         logger.error(f"Evergreen reset error: {e}")
     return {"topic": random.choice(topics), "category": category, "source": "evergreen"}
+
+async def run_single_topic(topic: str, chat_id: int):
+    """
+    Generate a single article from a manually added topic.
+    Full football stats support — pre and post match.
+    """
+    try:
+        # Classify topic
+        category = classify_topic(topic) or "news"
+        is_match = bool(re.search(r'\bvs?\.?\b', topic.lower()) or ' v ' in topic.lower())
+
+        await send_telegram(chat_id, f"📂 Classified as: <b>{category.upper()}</b>")
+
+        real_data = ""
+        _is_match = False
+        _confirmed_ft = False
+
+        if category == "football":
+            _is_match = is_match
+            if is_match:
+                await send_telegram(chat_id, "🔍 Fetching match data from API-Football...")
+                football_data = await fetch_football_data(topic)
+
+                if football_data and "COMPLETED MATCH" in football_data:
+                    _confirmed_ft = True
+                    await send_telegram(chat_id, "✅ Completed match data found — writing match report")
+                    news_context = await fetch_news_context(topic, "football")
+                    real_data = f"AUTHORITATIVE MATCH DATA:\n{football_data}"
+                    if news_context:
+                        real_data += f"\n\nNEWS CONTEXT:\n{news_context}"
+
+                elif football_data and "UPCOMING MATCH" in football_data:
+                    await send_telegram(chat_id, "📅 Match not yet played — writing preview with stats")
+                    # Fetch pre-match stats
+                    news_context = await fetch_news_context(topic, "football")
+                    safe_ctx = news_context or ""
+                    # Strip any score lines from context
+                    score_patterns = re.compile(r'\d+[-–]\d+|\bgoal\b|\bscored\b|\bfull.?time\b|\bFT\b', re.IGNORECASE)
+                    safe_lines = [l for l in safe_ctx.split('\n') if not score_patterns.search(l)]
+                    real_data = (
+                        "⛔ THIS MATCH HAS NOT BEEN PLAYED YET — WRITE A PREVIEW ONLY.\n"
+                        f"MATCH DATA:\n{football_data}\n\n"
+                        f"BACKGROUND CONTEXT (no scores):\n{chr(10).join(safe_lines)}"
+                    )
+                else:
+                    # No API data — fetch from news
+                    await send_telegram(chat_id, "ℹ️ No API-Football data — using news sources")
+                    news_context = await fetch_news_context(topic, "football")
+                    safe_lines = [l for l in (news_context or "").split('\n')
+                                  if not re.search(r'\d+[-–]\d+|\bscored\b|\bfull.?time\b', l, re.IGNORECASE)]
+                    real_data = (
+                        "⛔ NO CONFIRMED MATCH RESULT — WRITE A PREVIEW ONLY.\n\n"
+                        f"BACKGROUND CONTEXT:\n{chr(10).join(safe_lines)}"
+                    )
+            else:
+                # Non-match football topic (transfer, player news, standings)
+                football_data = await fetch_football_data(topic)
+                news_context = await fetch_news_context(topic, "football")
+                real_data = "\n\n".join(filter(None, [football_data, news_context]))
+
+        elif category == "finance":
+            finance_data = await fetch_finance_data(topic)
+            news_data = await fetch_news_context(topic, "finance")
+            real_data = "\n\n".join(filter(None, [finance_data, news_data]))
+
+        else:
+            real_data = await fetch_news_context(topic, category)
+
+        if not real_data:
+            await send_telegram(chat_id, f"⚠️ No data found for: <b>{topic}</b>. Try a more specific topic.")
+            return
+
+        # Generate article
+        article_data = await generate_article(topic, category, real_data, is_evergreen=False)
+
+        # Quality check
+        ok, reason = is_article_quality_ok(article_data)
+        if not ok:
+            await send_telegram(chat_id, f"⚠️ Quality check failed: {reason}\nTry /addtopic with a more specific version.")
+            return
+
+        # Post-gen fabrication check for unconfirmed matches
+        if _is_match and not _confirmed_ft:
+            article_text = (article_data.get("title","") + " " + article_data.get("excerpt","")).lower()
+            if re.search(r'\b\d+[-–]\d+\b', article_text) or any(w in article_text for w in ["beat ","defeated ","won the match"]):
+                await send_telegram(chat_id, f"⚠️ Article rejected — AI fabricated a match result for unconfirmed match. Try again after the match is played.")
+                return
+
+        # Save and send for approval
+        image_url = await fetch_image(article_data.get("image_query", topic), category, article_data.get("title",""))
+        slug = slugify(article_data["title"])
+        conn = get_db()
+        cur = conn.cursor()
+        cur.execute("""
+            INSERT INTO articles (slug, title, category, excerpt, body, image_url, status)
+            VALUES (%s, %s, %s, %s, %s, %s, 'pending') RETURNING id
+        """, (slug, article_data["title"], category, article_data.get("excerpt",""), article_data["body"], image_url))
+        article_id = cur.fetchone()["id"]
+        conn.commit()
+        cur.close()
+        conn.close()
+
+        mark_topic_used(topic)
+        await send_article_for_approval(article_id, article_data["title"], article_data.get("excerpt",""), category, topic)
+
+    except Exception as e:
+        logger.error(f"run_single_topic error: {e}")
+        await send_telegram(chat_id, f"❌ Error generating article: {e}")
+
 
 # ── MAIN PIPELINE ──
 async def run_pipeline(force_category: str = None):
@@ -2870,7 +2994,95 @@ Return ONLY this JSON — no markdown, no preamble:
                     await send_telegram(chat_id, "No active edit session.")
                 return {"ok": True}
 
-            elif text == "/start":
+            # ── ADDTOPICS SESSION HANDLER ──
+            # If admin sent /addtopics and is now sending their topic list
+            elif user_id in addtopics_sessions and not text.startswith("/"):
+                addtopics_sessions.discard(user_id)
+                raw_lines = [l.strip() for l in text.strip().split("\n") if l.strip()]
+                # Filter out lines that are too short or vague
+                valid_topics = [l for l in raw_lines if len(l) >= 10]
+                invalid = [l for l in raw_lines if len(l) < 10]
+
+                if not valid_topics:
+                    await send_telegram(chat_id,
+                        "⚠️ No valid topics found. Each topic must be at least 10 characters.\n\n"
+                        "Send /addtopics to try again."
+                    )
+                    return {"ok": True}
+
+                msg = f"✅ <b>{len(valid_topics)} topic{'s' if len(valid_topics) > 1 else ''} received.</b> Generating articles...\n"
+                if invalid:
+                    msg += f"\n⚠️ Skipped {len(invalid)} topic{'s' if len(invalid) > 1 else ''} (too short): {', '.join(invalid)}"
+                await send_telegram(chat_id, msg)
+
+                # Process each topic one by one
+                for topic in valid_topics:
+                    await run_single_topic(topic, chat_id)
+                    await asyncio.sleep(3)  # Small gap between articles
+
+                return {"ok": True}
+
+            elif text == "/addtopics":
+                if not is_admin(user_id):
+                    await send_telegram(chat_id, "⛔ Admins only.")
+                    return {"ok": True}
+                addtopics_sessions.add(user_id)
+                await send_telegram(chat_id,
+                    "📝 <b>Send your trending topics — one per line.</b>\n\n"
+                    "Use this format for each topic:\n"
+                    "<b>[Who] [What] [Where] [When]</b>\n\n"
+                    "<b>Examples:</b>\n"
+                    "Governor Adeleke stage collapse Osun State June 2026\n"
+                    "Blessing CEO EFCC arraigned N13M fraud Lagos June 2026\n"
+                    "Tinubu must go youth protest march Abuja June 2026\n"
+                    "Nigeria vs Ghana AFCON qualifier preview Uyo June 2026\n\n"
+                    "<b>Tips:</b>\n"
+                    "• <b>Who</b> — person or organisation (Governor Adeleke, EFCC, Super Eagles)\n"
+                    "• <b>What</b> — what happened (stage collapse, arraigned, protest march)\n"
+                    "• <b>Where</b> — location (Lagos, Abuja, Osun State, Nigeria)\n"
+                    "• <b>When</b> — date or month (June 2026, June 10)\n\n"
+                    "For football matches include 'vs': <i>Argentina vs Croatia Group D World Cup June 2026</i>\n\n"
+                    "Send as many topics as you want. I'll generate articles for each one. 👇"
+                )
+                return {"ok": True}
+
+            elif text.startswith("/addtopic "):
+                if not is_admin(user_id):
+                    await send_telegram(chat_id, "⛔ Admins only.")
+                    return {"ok": True}
+                topic = text[len("/addtopic "):].strip()
+                if len(topic) < 10:
+                    await send_telegram(chat_id,
+                        "⚠️ Topic too short or vague.\n\n"
+                        "Use this format:\n"
+                        "<b>/addtopic [Who] [What] [Where] [When]</b>\n\n"
+                        "Example:\n"
+                        "/addtopic Governor Adeleke stage collapse Osun State June 2026"
+                    )
+                    return {"ok": True}
+                await send_telegram(chat_id, f"⚙️ Generating article for:\n<b>{topic}</b>")
+                asyncio.create_task(run_single_topic(topic, chat_id))
+                return {"ok": True}
+
+            elif text == "/addtopic":
+                if not is_admin(user_id):
+                    await send_telegram(chat_id, "⛔ Admins only.")
+                    return {"ok": True}
+                await send_telegram(chat_id,
+                    "📝 <b>How to add a single topic:</b>\n\n"
+                    "<b>/addtopic [Who] [What] [Where] [When]</b>\n\n"
+                    "<b>Examples:</b>\n"
+                    "/addtopic Governor Adeleke stage collapse Osun State June 2026\n"
+                    "/addtopic Blessing CEO EFCC arraigned N13M fraud Lagos June 2026\n"
+                    "/addtopic Argentina vs Croatia Group D World Cup June 2026\n\n"
+                    "<b>Tips:</b>\n"
+                    "• <b>Who</b> — person or organisation\n"
+                    "• <b>What</b> — what happened\n"
+                    "• <b>Where</b> — location\n"
+                    "• <b>When</b> — date or month\n\n"
+                    "For multiple topics at once, use /addtopics"
+                )
+                return {"ok": True}
                 await send_telegram(chat_id, "👋 Welcome to <b>NaijaFlash Bot</b>!\n\nSend /help to see all commands.")
 
             elif text == "/help":
@@ -2878,7 +3090,9 @@ Return ONLY this JSON — no markdown, no preamble:
                     "🤖 <b>NaijaFlash Bot Commands</b>\n\n"
                     "/stats — Blog statistics (daily/weekly/monthly)\n"
                     "/trends — See what's trending in Nigeria now\n"
-                    "/generate — Generate articles (add category name for specific e.g. /generate football)\n\n"
+                    "/generate — Generate trending articles (add category e.g. /generate football)\n"
+                    "/addtopic — Add a single topic manually (bot shows format guide)\n"
+                    "/addtopics — Add multiple topics at once (bot prompts you)\n\n"
                     "<b>Category Shortcuts:</b>\n"
                     "/football ⚽ /finance 💰 /entertainment 🎭\n"
                     "/tech 📱 /health 🏥 /education 📚 /news 📰\n\n"
