@@ -1698,6 +1698,18 @@ def is_article_quality_ok(article: dict) -> tuple:
     if len(title) < 30:
         return False, f"Title too short/weak (under 30 chars): '{title}'"
 
+    # Body completeness check — detect truncated articles
+    if body:
+        body_stripped = body.strip()
+        # Check if body ends mid-sentence (truncated by token limit)
+        if body_stripped and not body_stripped[-1] in '.!?>"\'':
+            return False, "Article body appears truncated (doesn't end properly)"
+        # Check JSON is not broken — body should have at least one closing tag
+        if '<p>' in body_stripped and '</p>' not in body_stripped:
+            return False, "Article body HTML is incomplete (unclosed <p> tags)"
+        if body_stripped.endswith('...') or body_stripped.endswith('…'):
+            return False, "Article body truncated (ends with ellipsis)"
+
     # Suspicious phrases indicating the AI itself had no data and is talking to us
     # (first-person AI admissions only — NOT normal journalistic caution like "not confirmed")
     bad_phrases = [
@@ -1890,7 +1902,7 @@ Return ONLY this JSON — no markdown, no explanation, no preamble:
                     },
                     json={
                         "model": "claude-haiku-4-5-20251001",
-                        "max_tokens": 2500,
+                        "max_tokens": 4000,
                         "messages": [{"role": "user", "content": prompt}]
                     }
                 )
@@ -1913,7 +1925,7 @@ Return ONLY this JSON — no markdown, no explanation, no preamble:
                 model="llama-3.3-70b-versatile",
                 messages=[{"role": "user", "content": prompt}],
                 temperature=0.4,
-                max_tokens=2500
+                max_tokens=4000
             )
             text = response.choices[0].message.content.strip()
             text = text.replace("```json","").replace("```","").strip()
@@ -1938,7 +1950,7 @@ Return ONLY this JSON — no markdown, no explanation, no preamble:
                     },
                     json={
                         "model": "claude-haiku-4-5-20251001",
-                        "max_tokens": 2500,
+                        "max_tokens": 4000,
                         "messages": [{"role": "user", "content": prompt}]
                     }
                 )
@@ -1981,7 +1993,7 @@ async def send_telegram(chat_id: int, text: str, reply_markup: dict = None, pars
         logger.error(f"Telegram error to {chat_id}: {e}")
     return None
 
-def html_to_telegram(html: str, max_chars: int = 2000) -> tuple:
+def html_to_telegram(html: str, max_chars: int = 999999) -> tuple:
     """
     Convert HTML article body to readable Telegram text with proper spacing.
     Returns (formatted_text, word_count).
@@ -2014,10 +2026,6 @@ def html_to_telegram(html: str, max_chars: int = 2000) -> tuple:
 
     # Word count (from clean text)
     word_count = len(_re.sub(r'<[^>]+>', '', text).split())
-
-    # Trim if too long
-    if len(text) > max_chars:
-        text = text[:max_chars] + "...\n\n<i>[Article continues on website]</i>"
 
     return text, word_count
 
@@ -2080,10 +2088,27 @@ async def send_article_for_approval(article_id: int, title: str, excerpt: str, c
         f"<b>ID:</b> #{article_id} · 📊 <b>{word_count} words</b>\n\n"
         f"<b>📌 TITLE:</b>\n{title}\n\n"
         f"<b>📝 EXCERPT:</b>\n{excerpt}\n\n"
-        f"<b>📄 FULL ARTICLE:</b>\n{body_text}"
+        f"<b>📄 FULL ARTICLE:</b>"
     )
 
-    # Send image first if available, then text with buttons
+    # Split article body into chunks of 3500 chars to stay under Telegram's 4096 limit
+    CHUNK_SIZE = 3500
+    body_chunks = []
+    remaining = body_text
+    while remaining:
+        if len(remaining) <= CHUNK_SIZE:
+            body_chunks.append(remaining)
+            break
+        # Split at last newline before CHUNK_SIZE
+        split_at = remaining[:CHUNK_SIZE].rfind('\n\n')
+        if split_at == -1:
+            split_at = CHUNK_SIZE
+        body_chunks.append(remaining[:split_at])
+        remaining = remaining[split_at:].strip()
+
+    total_parts = len(body_chunks)
+
+    # Send image first if available
     if image_url:
         try:
             async with httpx.AsyncClient(timeout=10) as client:
@@ -2092,13 +2117,29 @@ async def send_article_for_approval(article_id: int, title: str, excerpt: str, c
                     json={
                         "chat_id": TELEGRAM_ADMIN_CHAT_ID,
                         "photo": image_url,
-                        "caption": f"🖼 Article #{article_id} image — tap 📷 Change Image to replace with your own"
+                        "caption": f"🖼 Article #{article_id} — tap 📷 Change Image to replace with your own photo"
                     }
                 )
         except Exception as e:
             logger.error(f"Failed to send image preview: {e}")
 
-    await send_to_all_admins(text, reply_markup=markup)
+    if total_parts == 1:
+        # Article fits in one message — send with buttons
+        full_text = text + "\n\n" + body_chunks[0]
+        await send_to_all_admins(full_text, reply_markup=markup)
+    else:
+        # Multiple parts — send body parts first, buttons only on last message
+        # Part 1: header + first chunk
+        await send_to_all_admins(text + f"\n\n📄 <i>Part 1 of {total_parts}</i>\n\n" + body_chunks[0])
+
+        # Middle parts
+        for i, chunk in enumerate(body_chunks[1:-1], 2):
+            await send_to_all_admins(f"📄 <i>Part {i} of {total_parts}</i>\n\n" + chunk)
+            await asyncio.sleep(0.5)  # Small delay to preserve order
+
+        # Last part with buttons
+        last_text = f"📄 <i>Part {total_parts} of {total_parts} — End of Article</i>\n\n" + body_chunks[-1]
+        await send_to_all_admins(last_text, reply_markup=markup)
 
 # ── TOPIC TRACKING ──
 def mark_topic_used(topic: str):
@@ -3115,7 +3156,7 @@ Return ONLY this JSON — no markdown, no preamble:
                             r = await client.post(
                                 "https://api.anthropic.com/v1/messages",
                                 headers={"x-api-key": ANTHROPIC_API_KEY, "anthropic-version": "2023-06-01", "content-type": "application/json"},
-                                json={"model": "claude-haiku-4-5-20251001", "max_tokens": 2500, "messages": [{"role": "user", "content": edit_prompt}]}
+                                json={"model": "claude-haiku-4-5-20251001", "max_tokens": 4000, "messages": [{"role": "user", "content": edit_prompt}]}
                             )
                             data = r.json()
                             edited_text = data["content"][0]["text"].strip()
