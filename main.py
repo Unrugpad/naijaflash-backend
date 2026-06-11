@@ -1712,9 +1712,11 @@ def is_article_quality_ok(article: dict) -> tuple:
         if phrase in combined:
             return False, f"AI spoke in first person: '{phrase}' found in content"
 
-    # Body too short
-    if len(body) < 200:
-        return False, "Article body too short"
+    # Word count check — minimum 300 words for AdSense compliance
+    import re as _re2
+    word_count = len(_re2.sub(r'<[^>]+>', '', body).split())
+    if word_count < 300:
+        return False, f"Article too short: {word_count} words (minimum 300 for AdSense)"
 
     # Football score fabrication check
     # If article has a specific scoreline but was generated without API-Football data,
@@ -1863,7 +1865,7 @@ STRICT RULES — FOLLOW EXACTLY:
 12. NIGERIA WORLD CUP RULE: Nigeria did NOT qualify for the 2026 FIFA World Cup. NEVER write articles about Nigeria preparing for or participating in the 2026 World Cup
 13. SINGLE STORY RULE: Write about ONE story only. Do not combine unrelated stories (e.g. economy + Ebola) into one article. Pick the main story from the data and focus on it
 14. Write in clear simple English Nigerians understand — no grammar competition
-15. Minimum 400 words, 2-3 subheadings using <h2> tags
+15. WORD COUNT: Minimum 400 words, maximum 800 words. 2-3 subheadings using <h2> tags. Articles under 400 words will be rejected.
 16. Nigerian context throughout — naira prices, local brands, Nigerian cities where relevant
 17. NEVER write phrases like "as of my knowledge" — if you don't have data, write general guidance
 
@@ -1979,6 +1981,47 @@ async def send_telegram(chat_id: int, text: str, reply_markup: dict = None, pars
         logger.error(f"Telegram error to {chat_id}: {e}")
     return None
 
+def html_to_telegram(html: str, max_chars: int = 2000) -> tuple:
+    """
+    Convert HTML article body to readable Telegram text with proper spacing.
+    Returns (formatted_text, word_count).
+    """
+    import re as _re
+    if not html:
+        return "", 0
+
+    text = html
+
+    # Convert headings to bold with spacing
+    text = _re.sub(r'<h2[^>]*>(.*?)</h2>', r'\n\n<b>📌 \1</b>\n', text, flags=_re.DOTALL)
+    text = _re.sub(r'<h3[^>]*>(.*?)</h3>', r'\n\n<b>\1</b>\n', text, flags=_re.DOTALL)
+
+    # Convert paragraphs — add blank line between each
+    text = _re.sub(r'<p[^>]*>(.*?)</p>', r'\n\n\1', text, flags=_re.DOTALL)
+
+    # Convert list items to bullets
+    text = _re.sub(r'<li[^>]*>(.*?)</li>', r'\n• \1', text, flags=_re.DOTALL)
+
+    # Convert strong/bold
+    text = _re.sub(r'<strong[^>]*>(.*?)</strong>', r'<b>\1</b>', text, flags=_re.DOTALL)
+
+    # Remove remaining HTML tags
+    text = _re.sub(r'<(?!b>|/b>|i>|/i>)[^>]+>', '', text)
+
+    # Clean up excessive blank lines (max 2 newlines)
+    text = _re.sub(r'\n{3,}', '\n\n', text)
+    text = text.strip()
+
+    # Word count (from clean text)
+    word_count = len(_re.sub(r'<[^>]+>', '', text).split())
+
+    # Trim if too long
+    if len(text) > max_chars:
+        text = text[:max_chars] + "...\n\n<i>[Article continues on website]</i>"
+
+    return text, word_count
+
+
 async def send_article_for_approval(article_id: int, title: str, excerpt: str, category: str, topic: str):
     """
     Send full article preview for approval:
@@ -2002,12 +2045,8 @@ async def send_article_for_approval(article_id: int, title: str, excerpt: str, c
     image_url = row['image_url'] if row else None
     body_html = row['body'] if row else ""
 
-    # Strip HTML tags for clean Telegram preview
-    import re as _re
-    body_text = _re.sub(r'<[^>]+>', '', body_html or "").strip()
-    # Trim to 1500 chars to fit Telegram limit
-    if len(body_text) > 1500:
-        body_text = body_text[:1500] + "...\n\n<i>[Article continues on website]</i>"
+    # Convert HTML to readable Telegram text with proper paragraph spacing
+    body_text, word_count = html_to_telegram(body_html, max_chars=2000)
 
     if cat == "uncategorized":
         cat_display = "⚠️ UNCATEGORIZED — Assign category before approving"
@@ -2038,7 +2077,7 @@ async def send_article_for_approval(article_id: int, title: str, excerpt: str, c
     text = (
         f"📰 <b>New Article Ready — Full Preview</b>\n\n"
         f"<b>Category:</b> {cat_display}\n"
-        f"<b>ID:</b> #{article_id}\n\n"
+        f"<b>ID:</b> #{article_id} · 📊 <b>{word_count} words</b>\n\n"
         f"<b>📌 TITLE:</b>\n{title}\n\n"
         f"<b>📝 EXCERPT:</b>\n{excerpt}\n\n"
         f"<b>📄 FULL ARTICLE:</b>\n{body_text}"
