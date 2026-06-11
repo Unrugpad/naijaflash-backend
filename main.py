@@ -10,7 +10,7 @@ from email.utils import parsedate_to_datetime
 from typing import Optional, List
 
 import httpx
-from fastapi import FastAPI, HTTPException, BackgroundTasks, Request
+from fastapi import FastAPI, HTTPException, BackgroundTasks, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 import psycopg2
 from psycopg2.extras import RealDictCursor
@@ -2777,7 +2777,7 @@ async def root():
     return {"status": "NaijaFlash API running", "version": "4.0.0"}
 
 @app.get("/api/articles")
-async def get_articles(category: Optional[str] = None, limit: int = 20, offset: int = 0):
+async def get_articles(category: Optional[str] = None, limit: int = 20, offset: int = 0, response: Response = None):
     conn = get_db()
     cur = conn.cursor()
     if category:
@@ -2795,6 +2795,9 @@ async def get_articles(category: Optional[str] = None, limit: int = 20, offset: 
     articles = cur.fetchall()
     cur.close()
     conn.close()
+    # Cache for 3 minutes — reduces Railway load, speeds up repeat visits
+    if response:
+        response.headers["Cache-Control"] = "public, max-age=180"
     return {"articles": [dict(a) for a in articles], "count": len(articles)}
 
 @app.get("/api/articles/{slug}")
