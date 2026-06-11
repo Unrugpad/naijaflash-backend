@@ -1957,6 +1957,8 @@ Return ONLY this JSON — no markdown, no explanation, no preamble:
 edit_sessions: dict = {}
 # AddTopics sessions: tracks which admin is waiting to send their topic list
 addtopics_sessions: set = set()
+# Image sessions: tracks which admin is uploading a custom image for which article
+image_sessions: dict = {}
 async def send_to_all_admins(text: str, reply_markup: dict = None):
     for chat_id in get_all_admins():
         await send_telegram(chat_id, text, reply_markup)
@@ -1978,35 +1980,85 @@ async def send_telegram(chat_id: int, text: str, reply_markup: dict = None, pars
     return None
 
 async def send_article_for_approval(article_id: int, title: str, excerpt: str, category: str, topic: str):
-    if category == "uncategorized":
+    """
+    Send full article preview for approval:
+    1. Article image (if available)
+    2. Full article text (title + excerpt + body preview)
+    3. Buttons: Approve, Reject, Edit, Change Image, Change Category
+    """
+    # Fetch full article from DB including body and image
+    try:
+        conn = get_db()
+        cur = conn.cursor()
+        cur.execute("SELECT title, excerpt, body, image_url, category FROM articles WHERE id=%s", (article_id,))
+        row = cur.fetchone()
+        cur.close()
+        conn.close()
+    except Exception as e:
+        logger.error(f"Error fetching article for approval: {e}")
+        row = None
+
+    cat = row['category'] if row else category
+    image_url = row['image_url'] if row else None
+    body_html = row['body'] if row else ""
+
+    # Strip HTML tags for clean Telegram preview
+    import re as _re
+    body_text = _re.sub(r'<[^>]+>', '', body_html or "").strip()
+    # Trim to 1500 chars to fit Telegram limit
+    if len(body_text) > 1500:
+        body_text = body_text[:1500] + "...\n\n<i>[Article continues on website]</i>"
+
+    if cat == "uncategorized":
         cat_display = "⚠️ UNCATEGORIZED — Assign category before approving"
         markup = {"inline_keyboard": [
             [
                 {"text": "📂 Assign Category", "callback_data": f"changecat_{article_id}"},
                 {"text": "✏️ Edit", "callback_data": f"edit_{article_id}"},
                 {"text": "❌ Reject", "callback_data": f"reject_{article_id}"}
+            ],
+            [
+                {"text": "📷 Change Image", "callback_data": f"changeimg_{article_id}"}
             ]
         ]}
     else:
-        cat_display = category.upper()
+        cat_display = cat.upper()
         markup = {"inline_keyboard": [
             [
                 {"text": "✅ Approve", "callback_data": f"approve_{article_id}"},
                 {"text": "❌ Reject", "callback_data": f"reject_{article_id}"}
             ],
             [
-                {"text": "✏️ Edit Article", "callback_data": f"edit_{article_id}"},
-                {"text": "📂 Change Category", "callback_data": f"changecat_{article_id}"}
+                {"text": "✏️ Edit", "callback_data": f"edit_{article_id}"},
+                {"text": "📷 Change Image", "callback_data": f"changeimg_{article_id}"},
+                {"text": "📂 Category", "callback_data": f"changecat_{article_id}"}
             ]
         ]}
+
     text = (
-        f"📰 <b>New Article Ready</b>\n\n"
-        f"<b>Trending:</b> {topic}\n"
-        f"<b>Category:</b> {cat_display}\n\n"
-        f"<b>Title:</b>\n{title}\n\n"
-        f"<b>Excerpt:</b>\n{excerpt}\n\n"
-        f"<b>ID:</b> #{article_id}"
+        f"📰 <b>New Article Ready — Full Preview</b>\n\n"
+        f"<b>Category:</b> {cat_display}\n"
+        f"<b>ID:</b> #{article_id}\n\n"
+        f"<b>📌 TITLE:</b>\n{title}\n\n"
+        f"<b>📝 EXCERPT:</b>\n{excerpt}\n\n"
+        f"<b>📄 FULL ARTICLE:</b>\n{body_text}"
     )
+
+    # Send image first if available, then text with buttons
+    if image_url:
+        try:
+            async with httpx.AsyncClient(timeout=10) as client:
+                await client.post(
+                    f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendPhoto",
+                    json={
+                        "chat_id": TELEGRAM_ADMIN_CHAT_ID,
+                        "photo": image_url,
+                        "caption": f"🖼 Article #{article_id} image — tap 📷 Change Image to replace with your own"
+                    }
+                )
+        except Exception as e:
+            logger.error(f"Failed to send image preview: {e}")
+
     await send_to_all_admins(text, reply_markup=markup)
 
 # ── TOPIC TRACKING ──
@@ -2813,7 +2865,14 @@ async def telegram_webhook(request: Request):
                     f"Send /canceledit to cancel."
                 )
 
-            elif cb_data.startswith("changecat_"):
+            elif cb_data.startswith("changeimg_"):
+                article_id = int(cb_data.split("_")[1])
+                image_sessions[str(cb["from"]["id"])] = article_id
+                await send_telegram(cb["from"]["id"],
+                    f"📷 <b>Send your image for article #{article_id}</b>\n\n"
+                    f"Send any photo from your phone and it will replace the current image.\n\n"
+                    f"Send /cancelimage to cancel."
+                )
                 article_id = int(cb_data.split("_")[1])
                 # Show category selection buttons (real categories only — not uncategorized)
                 cat_buttons = []
@@ -2940,7 +2999,44 @@ async def telegram_webhook(request: Request):
             chat_id = msg["chat"]["id"]
             user_id = msg["from"]["id"]
 
-            # ── EDIT SESSION HANDLER ──
+            # ── IMAGE UPLOAD HANDLER ──
+            # If admin is in an image session and sends a photo
+            if str(user_id) in image_sessions and "photo" in msg:
+                article_id = image_sessions.pop(str(user_id))
+                try:
+                    # Get the largest photo size
+                    photos = msg["photo"]
+                    file_id = photos[-1]["file_id"]
+
+                    # Get file path from Telegram
+                    async with httpx.AsyncClient(timeout=15) as client:
+                        r = await client.get(
+                            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getFile",
+                            params={"file_id": file_id}
+                        )
+                        file_path = r.json()["result"]["file_path"]
+                        image_url = f"https://api.telegram.org/file/bot{TELEGRAM_BOT_TOKEN}/{file_path}"
+
+                    # Update article image
+                    conn = get_db()
+                    cur = conn.cursor()
+                    cur.execute("UPDATE articles SET image_url=%s WHERE id=%s RETURNING title", (image_url, article_id))
+                    row = cur.fetchone()
+                    conn.commit()
+                    cur.close()
+                    conn.close()
+
+                    if row:
+                        await send_telegram(chat_id,
+                            f"✅ <b>Image updated for article #{article_id}</b>\n\n"
+                            f"Your photo is now set as the article image.\n"
+                            f"Use /approve {article_id} to publish."
+                        )
+                    else:
+                        await send_telegram(chat_id, f"❌ Article #{article_id} not found.")
+                except Exception as e:
+                    await send_telegram(chat_id, f"❌ Image upload failed: {e}")
+                return {"ok": True}
             # If admin is in an edit session, treat their message as an edit instruction
             if str(user_id) in edit_sessions and not text.startswith("/"):
                 article_id = edit_sessions.pop(str(user_id))
@@ -3009,7 +3105,8 @@ Return ONLY this JSON — no markdown, no preamble:
                                     ],
                                     [
                                         {"text": "✏️ Edit Again", "callback_data": f"edit_{article_id}"},
-                                        {"text": "📂 Change Category", "callback_data": f"changecat_{article_id}"}
+                                        {"text": "📷 Change Image", "callback_data": f"changeimg_{article_id}"},
+                                        {"text": "📂 Category", "callback_data": f"changecat_{article_id}"}
                                     ]
                                 ]}
                                 await send_telegram(chat_id,
@@ -3022,6 +3119,14 @@ Return ONLY this JSON — no markdown, no preamble:
                                 await send_telegram(chat_id, "❌ Edit failed — could not parse response. Try again.")
                 except Exception as e:
                     await send_telegram(chat_id, f"❌ Edit error: {e}")
+                return {"ok": True}
+
+            elif text == "/cancelimage":
+                if str(user_id) in image_sessions:
+                    article_id = image_sessions.pop(str(user_id))
+                    await send_telegram(chat_id, f"✅ Image upload cancelled for article #{article_id}.")
+                else:
+                    await send_telegram(chat_id, "No active image upload session.")
                 return {"ok": True}
 
             elif text == "/canceledit":
@@ -3146,7 +3251,8 @@ Return ONLY this JSON — no markdown, no preamble:
                     "/reject [id] — Reject an article (keeps in DB)\n"
                     "/unpublish [id] — Take a published article off the frontend\n"
                     "/delete [id] — Permanently delete an article\n"
-                    "/delete [id] — Delete an article by ID\n\n"
+                    "/canceledit — Cancel active edit session\n"
+                    "/cancelimage — Cancel active image upload\n"
                     "<b>Sponsored Articles:</b>\n"
                     "/sponsored — Create a sponsored article\n"
                     "/listsponsored — View all sponsored articles\n"
