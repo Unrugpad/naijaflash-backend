@@ -1746,6 +1746,9 @@ def parse_article_json(text: str) -> dict:
         logger.error(f"Manual JSON extraction failed: {e}")
 
     raise ValueError("Could not parse article JSON from AI response")
+
+
+def is_article_quality_ok(article: dict) -> tuple:
     """
     Basic quality check before sending to Telegram.
     Returns (ok: bool, reason: str)
