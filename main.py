@@ -119,6 +119,14 @@ NEWS_KEYWORDS = [
     "minister","commissioner","policy","law","bill","election","vote","inec","tribunal",
     "budget","subsidy","fuel","petrol","electricity","power","tariff","tax","customs",
     "immigration","visa","passport","foreign affairs","united nations","african union",
+    # Crime, fraud, legal proceedings
+    "arraigned","arrested","charged","fraud","scam","sentenced","bail",
+    "detained","custody","prison","court hearing","federal high court","magistrate",
+    "money laundering","cybercrime","convict","prosecution","defendant",
+    # Social issues and protests
+    "vdm","verydarkman","tinubu must go","protest march","rally","demonstration",
+    "stage collapse","accident","fire outbreak","flooding","kidnap","shooting",
+    "blessing ceo","blessing okoro","carter efe","kolu","social media influencer",
     # Nigerian states, cities, politicians
     "kwankwaso","obiano","okowa","makinde","sanwoolu","ganduje","zulum","fayemi",
     "abuja","kano","ibadan","port harcourt","kaduna","enugu","benin city",
@@ -1804,6 +1812,9 @@ async def generate_article(topic: str, category: str, real_data: str = "", is_ev
             "\nNEWS RULES:"
             "\n- CURRENT NEWS ONLY: Only write about events that happened in the last 30 days. If the real data describes an event from 2024 or earlier, do NOT write about it as current news"
             "\n- Always state when something happened — include the date or month"
+            "\n- TINUBU PROTESTS: 'Tinubu Must Go' protests are youth-led. VeryDarkMan (VDM) is a key figure. Do NOT attribute protest leadership to Peter Obi or politicians unless explicitly confirmed in the data"
+            "\n- INJURIES: Never say 'no injuries' or 'no one was hurt' unless officially confirmed. Use 'no serious injuries reported' instead"
+            "\n- EFCC/COURT: Always include the specific charge, court name, date. Never speculate on guilt"
             "\n- For government policy articles: include both positive and negative angles — never one-sided"
             "\n- For security/attack articles: include official government response and security forces reaction"
             "\n- Never present unverified death tolls as confirmed — say 'at least' or 'according to sources'"
@@ -2191,6 +2202,18 @@ async def run_single_topic(topic: str, chat_id: int):
     If user includes a score in the topic (e.g. "2-1"), treat as confirmed result.
     """
     try:
+        # Fix 1: Strip anything in square brackets from topic (e.g. [premarch reviews])
+        topic = re.sub(r'\[.*?\]', '', topic).strip()
+        topic = re.sub(r'\s+', ' ', topic)  # Clean up extra spaces
+
+        if len(topic) < 10:
+            await send_telegram(chat_id, "⚠️ Topic too short after cleaning. Please be more specific.")
+            return
+
+        # Fix 4: Check if similar topic already used recently (dedup)
+        if is_topic_used(topic):
+            await send_telegram(chat_id, f"ℹ️ Similar topic already covered: <b>{topic[:60]}</b>\nSkipping to avoid duplicate.")
+            return
         # Classify topic
         category = classify_topic(topic) or "news"
         is_match = bool(re.search(r'\bvs?\.?\b', topic.lower()) or ' v ' in topic.lower())
@@ -3014,9 +3037,16 @@ Return ONLY this JSON — no markdown, no preamble:
             elif user_id in addtopics_sessions and not text.startswith("/"):
                 addtopics_sessions.discard(user_id)
                 raw_lines = [l.strip() for l in text.strip().split("\n") if l.strip()]
+                # Strip bracket text and clean each topic
+                cleaned_lines = []
+                for l in raw_lines:
+                    clean = re.sub(r'\[.*?\]', '', l).strip()
+                    clean = re.sub(r'\s+', ' ', clean)
+                    if clean:
+                        cleaned_lines.append(clean)
                 # Filter out lines that are too short or vague
-                valid_topics = [l for l in raw_lines if len(l) >= 10]
-                invalid = [l for l in raw_lines if len(l) < 10]
+                valid_topics = [l for l in cleaned_lines if len(l) >= 10]
+                invalid = [l for l in cleaned_lines if len(l) < 10]
 
                 if not valid_topics:
                     await send_telegram(chat_id,
@@ -3111,7 +3141,10 @@ Return ONLY this JSON — no markdown, no preamble:
                     "<b>Category Shortcuts:</b>\n"
                     "/football ⚽ /finance 💰 /entertainment 🎭\n"
                     "/tech 📱 /health 🏥 /education 📚 /news 📰\n\n"
-                    "/pending — View pending articles\n"
+                    "/pending — View all pending articles\n"
+                    "/approve [id] — Approve and publish an article\n"
+                    "/reject [id] — Reject an article (keeps in DB)\n"
+                    "/delete [id] — Permanently delete an article\n"
                     "/delete [id] — Delete an article by ID\n\n"
                     "<b>Sponsored Articles:</b>\n"
                     "/sponsored — Create a sponsored article\n"
@@ -3241,6 +3274,37 @@ Return ONLY this JSON — no markdown, no preamble:
                 await send_telegram(chat_id, f"⚙️ Generating <b>{cat.upper()}</b> articles...")
                 asyncio.create_task(run_pipeline(cat))
 
+            elif text == "/pending":
+                if not is_admin(user_id):
+                    await send_telegram(chat_id, "⛔ Admins only.")
+                    return {"ok": True}
+                try:
+                    conn = get_db()
+                    cur = conn.cursor()
+                    cur.execute("""
+                        SELECT id, title, category, created_at
+                        FROM articles
+                        WHERE status='pending'
+                        ORDER BY created_at DESC
+                        LIMIT 20
+                    """)
+                    rows = cur.fetchall()
+                    cur.close()
+                    conn.close()
+                    if not rows:
+                        await send_telegram(chat_id, "✅ No pending articles right now.")
+                    else:
+                        msg = f"📋 <b>{len(rows)} Pending Article{'s' if len(rows) > 1 else ''}:</b>\n\n"
+                        for row in rows:
+                            cat = row['category'].upper()
+                            title = row['title'][:50]
+                            article_id = row['id']
+                            msg += f"• <b>#{article_id}</b> [{cat}] {title}\n"
+                            msg += f"  /approve {article_id} | /reject {article_id} | /delete {article_id}\n\n"
+                        await send_telegram(chat_id, msg)
+                except Exception as e:
+                    await send_telegram(chat_id, f"❌ Error: {e}")
+
             elif text.startswith("/approve "):
                 if not is_admin(user_id):
                     await send_telegram(chat_id, "⛔ Admins only.")
@@ -3260,20 +3324,46 @@ Return ONLY this JSON — no markdown, no preamble:
                         await send_telegram(chat_id, f"❌ Article #{article_id} not found.")
                 except Exception as e:
                     await send_telegram(chat_id, f"❌ Error: {e}")
+
+            elif text.startswith("/reject "):
                 if not is_admin(user_id):
                     await send_telegram(chat_id, "⛔ Admins only.")
                     return {"ok": True}
-                conn = get_db()
-                cur = conn.cursor()
-                cur.execute("SELECT id, title, category FROM articles WHERE status='pending' ORDER BY created_at DESC LIMIT 5")
-                rows = cur.fetchall()
-                cur.close()
-                conn.close()
-                if rows:
-                    lines = "\n".join([f"#{r['id']} [{r['category']}] {r['title'][:50]}..." for r in rows])
-                    await send_telegram(chat_id, f"⏳ <b>Pending Articles</b>\n\n{lines}")
-                else:
-                    await send_telegram(chat_id, "No pending articles.")
+                try:
+                    article_id = int(text.split()[1])
+                    conn = get_db()
+                    cur = conn.cursor()
+                    cur.execute("UPDATE articles SET status='rejected' WHERE id=%s RETURNING title", (article_id,))
+                    row = cur.fetchone()
+                    conn.commit()
+                    cur.close()
+                    conn.close()
+                    if row:
+                        await send_telegram(chat_id, f"❌ Article #{article_id} rejected.")
+                    else:
+                        await send_telegram(chat_id, f"❌ Article #{article_id} not found.")
+                except Exception as e:
+                    await send_telegram(chat_id, f"❌ Error: {e}")
+
+            elif text.startswith("/delete "):
+                if not is_admin(user_id):
+                    await send_telegram(chat_id, "⛔ Admins only.")
+                    return {"ok": True}
+                try:
+                    article_id = int(text.split()[1])
+                    conn = get_db()
+                    cur = conn.cursor()
+                    cur.execute("DELETE FROM articles WHERE id=%s RETURNING title", (article_id,))
+                    row = cur.fetchone()
+                    conn.commit()
+                    cur.close()
+                    conn.close()
+                    if row:
+                        await send_telegram(chat_id, f"🗑️ Article #{article_id} permanently deleted.\n<i>{row['title'][:60]}</i>")
+                    else:
+                        await send_telegram(chat_id, f"❌ Article #{article_id} not found.")
+                except Exception as e:
+                    await send_telegram(chat_id, f"❌ Error: {e}")
 
             elif text.startswith("/addadmin"):
                 if not is_owner(user_id):
