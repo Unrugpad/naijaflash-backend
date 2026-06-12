@@ -2129,6 +2129,9 @@ async def upload_to_imgbb(file_id: str) -> str:
     except Exception as e:
         logger.error(f"ImgBB upload error: {e}")
         return ""
+
+
+async def send_article_for_approval(article_id: int, title: str, excerpt: str, category: str, topic: str):
     """
     Send full article preview for approval:
     1. Article image (if available)
@@ -3319,7 +3322,7 @@ async def telegram_webhook(request: Request):
 
             # ── WRITE SESSION HANDLER ──
             # If admin is in a write session, handle each step
-            if str(user_id) in write_sessions and (not text.startswith("/") or text == "/skip"):
+            if str(user_id) in write_sessions and "photo" not in msg and (not text.startswith("/") or text == "/skip"):
                 session = write_sessions[str(user_id)]
                 step = session.get("step")
 
