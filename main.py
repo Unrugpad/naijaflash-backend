@@ -2089,7 +2089,46 @@ def html_to_telegram(html: str, max_chars: int = 999999) -> tuple:
     return text, word_count
 
 
-async def send_article_for_approval(article_id: int, title: str, excerpt: str, category: str, topic: str):
+IMGBB_API_KEY = "bb34edfe60a18cad8fdf68a6eb7b70ea"
+
+async def upload_to_imgbb(file_id: str) -> str:
+    """
+    Download photo from Telegram and upload to ImgBB for permanent storage.
+    Returns permanent ImgBB URL or empty string on failure.
+    """
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            # Step 1: Get file path from Telegram
+            r = await client.get(
+                f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getFile",
+                params={"file_id": file_id}
+            )
+            file_path = r.json()["result"]["file_path"]
+
+            # Step 2: Download the image bytes from Telegram
+            img_response = await client.get(
+                f"https://api.telegram.org/file/bot{TELEGRAM_BOT_TOKEN}/{file_path}"
+            )
+            img_bytes = img_response.content
+
+            # Step 3: Upload to ImgBB
+            import base64
+            img_b64 = base64.b64encode(img_bytes).decode("utf-8")
+            upload_response = await client.post(
+                "https://api.imgbb.com/1/upload",
+                data={"key": IMGBB_API_KEY, "image": img_b64}
+            )
+            result = upload_response.json()
+            if result.get("success"):
+                permanent_url = result["data"]["url"]
+                logger.info(f"Image uploaded to ImgBB: {permanent_url}")
+                return permanent_url
+            else:
+                logger.error(f"ImgBB upload failed: {result}")
+                return ""
+    except Exception as e:
+        logger.error(f"ImgBB upload error: {e}")
+        return ""
     """
     Send full article preview for approval:
     1. Article image (if available)
@@ -3140,19 +3179,16 @@ async def telegram_webhook(request: Request):
                     # Clear write session
                     write_sessions.pop(session_user_id, None)
 
+                    # Confirm to user
+                    await send_telegram(cb["from"]["id"], f"✅ Article saved as #{article_id}. Sending full preview...")
+
                     # Send for approval with full preview
                     await send_article_for_approval(article_id, title, excerpt, category, f"manual-{article_id}")
 
                 except Exception as e:
                     await send_telegram(cb["from"]["id"], f"❌ Error saving article: {e}")
-                    return {"ok": True}
-                article_id = int(cb_data.split("_")[1])
-                image_sessions[str(cb["from"]["id"])] = article_id
-                await send_telegram(cb["from"]["id"],
-                    f"📷 <b>Send your image for article #{article_id}</b>\n\n"
-                    f"Send any photo from your phone and it will replace the current image.\n\n"
-                    f"Send /cancelimage to cancel."
-                )
+
+                return {"ok": True}
 
             elif cb_data.startswith("changecat_"):
                 article_id = int(cb_data.split("_")[1])
@@ -3283,7 +3319,7 @@ async def telegram_webhook(request: Request):
 
             # ── WRITE SESSION HANDLER ──
             # If admin is in a write session, handle each step
-            if str(user_id) in write_sessions and not text.startswith("/") or (str(user_id) in write_sessions and text in ["/skip"]):
+            if str(user_id) in write_sessions and (not text.startswith("/") or text == "/skip"):
                 session = write_sessions[str(user_id)]
                 step = session.get("step")
 
@@ -3303,8 +3339,10 @@ async def telegram_webhook(request: Request):
                     session["step"] = "image"
                     await send_telegram(chat_id,
                         f"✅ Article body saved.\n\n"
-                        f"📷 <b>Step 3/5 — Send your article image:</b>\n\n"
-                        f"Send a photo from your phone, or type /skip to use a default image."
+                        f"📷 <b>Step 3/5 — Add an image:</b>\n\n"
+                        f"• Send a photo from your phone\n"
+                        f"• Or paste an image URL (https://...)\n"
+                        f"• Or type /skip to use a default image"
                     )
                     return {"ok": True}
 
@@ -3312,7 +3350,18 @@ async def telegram_webhook(request: Request):
                     session["image_url"] = ""
                     session["step"] = "source"
                     await send_telegram(chat_id,
-                        f"✅ Skipped image.\n\n"
+                        f"✅ Skipped image — default will be used.\n\n"
+                        f"🔗 <b>Step 4/5 — Send a source link:</b>\n\n"
+                        f"Paste the URL of the original news source, or type /skip."
+                    )
+                    return {"ok": True}
+
+                elif step == "image" and (text.startswith("http://") or text.startswith("https://")):
+                    # Accept image URL directly
+                    session["image_url"] = text.strip()
+                    session["step"] = "source"
+                    await send_telegram(chat_id,
+                        f"✅ Image URL saved.\n\n"
                         f"🔗 <b>Step 4/5 — Send a source link:</b>\n\n"
                         f"Paste the URL of the original news source, or type /skip."
                     )
@@ -3351,17 +3400,26 @@ async def telegram_webhook(request: Request):
                     try:
                         photos = msg["photo"]
                         file_id = photos[-1]["file_id"]
-                        async with httpx.AsyncClient(timeout=15) as client:
-                            r = await client.get(
-                                f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getFile",
-                                params={"file_id": file_id}
-                            )
-                            file_path = r.json()["result"]["file_path"]
-                            image_url = f"https://api.telegram.org/file/bot{TELEGRAM_BOT_TOKEN}/{file_path}"
+
+                        await send_telegram(chat_id, "⏳ Uploading image to permanent storage...")
+
+                        # Upload to ImgBB for permanent URL
+                        image_url = await upload_to_imgbb(file_id)
+
+                        if not image_url:
+                            # Fallback to Telegram URL
+                            async with httpx.AsyncClient(timeout=15) as client:
+                                r = await client.get(
+                                    f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getFile",
+                                    params={"file_id": file_id}
+                                )
+                                file_path = r.json()["result"]["file_path"]
+                                image_url = f"https://api.telegram.org/file/bot{TELEGRAM_BOT_TOKEN}/{file_path}"
+
                         session["image_url"] = image_url
                         session["step"] = "source"
                         await send_telegram(chat_id,
-                            f"✅ Image saved.\n\n"
+                            f"✅ Image uploaded and saved permanently.\n\n"
                             f"🔗 <b>Step 4/5 — Send a source link:</b>\n\n"
                             f"Paste the URL of the original news source, or type /skip."
                         )
@@ -3374,18 +3432,23 @@ async def telegram_webhook(request: Request):
             if str(user_id) in image_sessions and "photo" in msg:
                 article_id = image_sessions.pop(str(user_id))
                 try:
-                    # Get the largest photo size
                     photos = msg["photo"]
                     file_id = photos[-1]["file_id"]
 
-                    # Get file path from Telegram
-                    async with httpx.AsyncClient(timeout=15) as client:
-                        r = await client.get(
-                            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getFile",
-                            params={"file_id": file_id}
-                        )
-                        file_path = r.json()["result"]["file_path"]
-                        image_url = f"https://api.telegram.org/file/bot{TELEGRAM_BOT_TOKEN}/{file_path}"
+                    await send_telegram(chat_id, "⏳ Uploading image to permanent storage...")
+
+                    # Upload to ImgBB for permanent URL
+                    image_url = await upload_to_imgbb(file_id)
+
+                    if not image_url:
+                        # Fallback to Telegram URL if ImgBB fails
+                        async with httpx.AsyncClient(timeout=15) as client:
+                            r = await client.get(
+                                f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getFile",
+                                params={"file_id": file_id}
+                            )
+                            file_path = r.json()["result"]["file_path"]
+                            image_url = f"https://api.telegram.org/file/bot{TELEGRAM_BOT_TOKEN}/{file_path}"
 
                     # Update article image
                     conn = get_db()
@@ -3399,7 +3462,7 @@ async def telegram_webhook(request: Request):
                     if row:
                         await send_telegram(chat_id,
                             f"✅ <b>Image updated for article #{article_id}</b>\n\n"
-                            f"Your photo is now set as the article image.\n"
+                            f"Permanent image URL saved.\n"
                             f"Use /approve {article_id} to publish."
                         )
                     else:
