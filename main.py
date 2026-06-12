@@ -2030,6 +2030,8 @@ edit_sessions: dict = {}
 addtopics_sessions: set = set()
 # Image sessions: tracks which admin is uploading a custom image for which article
 image_sessions: dict = {}
+# Write sessions: tracks manual article creation step by step
+write_sessions: dict = {}  # user_id -> {step, title, body, image_url, source_link}
 async def send_to_all_admins(text: str, reply_markup: dict = None):
     for chat_id in get_all_admins():
         await send_telegram(chat_id, text, reply_markup)
@@ -3081,7 +3083,69 @@ async def telegram_webhook(request: Request):
                     f"Send /canceledit to cancel."
                 )
 
-            elif cb_data.startswith("changeimg_"):
+            elif cb_data.startswith("writecat_"):
+                parts = cb_data.split("_")
+                session_user_id = parts[1]
+                category = parts[2]
+                session = write_sessions.get(session_user_id)
+                if not session:
+                    await send_telegram(cb["from"]["id"], "❌ Session expired. Start again with /write.")
+                    return {"ok": True}
+
+                title = session.get("title", "")
+                body_text = session.get("body", "")
+                image_url = session.get("image_url", "")
+                source_link = session.get("source_link", "")
+
+                # Convert plain text body to HTML paragraphs
+                paragraphs = [p.strip() for p in body_text.split('\n\n') if p.strip()]
+                if not paragraphs:
+                    paragraphs = [body_text]
+                body_html = "".join([f"<p>{p}</p>" for p in paragraphs])
+
+                # Add source link if provided
+                if source_link:
+                    body_html += f'<p><strong>Source:</strong> <a href="{source_link}">{source_link}</a></p>'
+
+                # Generate excerpt from first paragraph
+                excerpt = paragraphs[0][:200] if paragraphs else title
+
+                # Get default image if none provided
+                if not image_url:
+                    default_images = {
+                        "football": "https://images.unsplash.com/photo-1574629810360-7efbbe195018?w=900&q=80",
+                        "finance": "https://images.unsplash.com/photo-1611974789855-9c2a0a7236a3?w=900&q=80",
+                        "entertainment": "https://images.unsplash.com/photo-1493225457124-a3eb161ffa5f?w=900&q=80",
+                        "tech": "https://images.unsplash.com/photo-1518770660439-4636190af475?w=900&q=80",
+                        "health": "https://images.unsplash.com/photo-1559757148-5c350d0d3c56?w=900&q=80",
+                        "education": "https://images.unsplash.com/photo-1481627834876-b7833e8f5570?w=900&q=80",
+                        "news": "https://images.unsplash.com/photo-1508921912186-1d1a45ebb3c1?w=900&q=80",
+                    }
+                    image_url = default_images.get(category, default_images["news"])
+
+                # Save to database
+                slug = slugify(title)
+                try:
+                    conn = get_db()
+                    cur = conn.cursor()
+                    cur.execute("""
+                        INSERT INTO articles (slug, title, category, excerpt, body, image_url, status)
+                        VALUES (%s, %s, %s, %s, %s, %s, 'pending') RETURNING id
+                    """, (slug, title, category, excerpt, body_html, image_url))
+                    article_id = cur.fetchone()["id"]
+                    conn.commit()
+                    cur.close()
+                    conn.close()
+
+                    # Clear write session
+                    write_sessions.pop(session_user_id, None)
+
+                    # Send for approval with full preview
+                    await send_article_for_approval(article_id, title, excerpt, category, f"manual-{article_id}")
+
+                except Exception as e:
+                    await send_telegram(cb["from"]["id"], f"❌ Error saving article: {e}")
+                    return {"ok": True}
                 article_id = int(cb_data.split("_")[1])
                 image_sessions[str(cb["from"]["id"])] = article_id
                 await send_telegram(cb["from"]["id"],
@@ -3216,6 +3280,94 @@ async def telegram_webhook(request: Request):
             text = msg.get("text","").strip()
             chat_id = msg["chat"]["id"]
             user_id = msg["from"]["id"]
+
+            # ── WRITE SESSION HANDLER ──
+            # If admin is in a write session, handle each step
+            if str(user_id) in write_sessions and not text.startswith("/") or (str(user_id) in write_sessions and text in ["/skip"]):
+                session = write_sessions[str(user_id)]
+                step = session.get("step")
+
+                if step == "title":
+                    session["title"] = text.strip()
+                    session["step"] = "body"
+                    await send_telegram(chat_id,
+                        f"✅ Title saved.\n\n"
+                        f"📝 <b>Step 2/5 — Send your article body:</b>\n\n"
+                        f"Write as many paragraphs as you want. Use plain text — no HTML needed.\n\n"
+                        f"Send /cancelwrite to cancel."
+                    )
+                    return {"ok": True}
+
+                elif step == "body":
+                    session["body"] = text.strip()
+                    session["step"] = "image"
+                    await send_telegram(chat_id,
+                        f"✅ Article body saved.\n\n"
+                        f"📷 <b>Step 3/5 — Send your article image:</b>\n\n"
+                        f"Send a photo from your phone, or type /skip to use a default image."
+                    )
+                    return {"ok": True}
+
+                elif step == "image" and text == "/skip":
+                    session["image_url"] = ""
+                    session["step"] = "source"
+                    await send_telegram(chat_id,
+                        f"✅ Skipped image.\n\n"
+                        f"🔗 <b>Step 4/5 — Send a source link:</b>\n\n"
+                        f"Paste the URL of the original news source, or type /skip."
+                    )
+                    return {"ok": True}
+
+                elif step == "source":
+                    if text == "/skip":
+                        session["source_link"] = ""
+                    else:
+                        session["source_link"] = text.strip()
+                    session["step"] = "category"
+                    # Show category buttons
+                    cat_emojis = {"football":"⚽","finance":"💰","entertainment":"🎭","tech":"📱","health":"🏥","education":"📚","news":"📰"}
+                    cat_buttons = []
+                    row = []
+                    for cat in REAL_CATEGORIES:
+                        row.append({"text": f"{cat_emojis.get(cat,'📄')} {cat.capitalize()}", "callback_data": f"writecat_{user_id}_{cat}"})
+                        if len(row) == 3:
+                            cat_buttons.append(row)
+                            row = []
+                    if row:
+                        cat_buttons.append(row)
+                    await send_telegram(chat_id,
+                        f"✅ Source link saved.\n\n"
+                        f"📂 <b>Step 5/5 — Choose a category:</b>",
+                        reply_markup={"inline_keyboard": cat_buttons}
+                    )
+                    return {"ok": True}
+
+                return {"ok": True}
+
+            # ── WRITE SESSION PHOTO HANDLER ──
+            if str(user_id) in write_sessions and "photo" in msg:
+                session = write_sessions[str(user_id)]
+                if session.get("step") == "image":
+                    try:
+                        photos = msg["photo"]
+                        file_id = photos[-1]["file_id"]
+                        async with httpx.AsyncClient(timeout=15) as client:
+                            r = await client.get(
+                                f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getFile",
+                                params={"file_id": file_id}
+                            )
+                            file_path = r.json()["result"]["file_path"]
+                            image_url = f"https://api.telegram.org/file/bot{TELEGRAM_BOT_TOKEN}/{file_path}"
+                        session["image_url"] = image_url
+                        session["step"] = "source"
+                        await send_telegram(chat_id,
+                            f"✅ Image saved.\n\n"
+                            f"🔗 <b>Step 4/5 — Send a source link:</b>\n\n"
+                            f"Paste the URL of the original news source, or type /skip."
+                        )
+                    except Exception as e:
+                        await send_telegram(chat_id, f"❌ Image upload failed: {e}\nTry again or type /skip.")
+                    return {"ok": True}
 
             # ── IMAGE UPLOAD HANDLER ──
             # If admin is in an image session and sends a photo
@@ -3386,7 +3538,27 @@ Return ONLY this JSON — no markdown, no preamble:
 
                 return {"ok": True}
 
-            elif text == "/addtopics":
+            elif text == "/write":
+                if not is_admin(user_id):
+                    await send_telegram(chat_id, "⛔ Admins only.")
+                    return {"ok": True}
+                write_sessions[str(user_id)] = {"step": "title"}
+                await send_telegram(chat_id,
+                    "✍️ <b>Create Article — Step 1/5</b>\n\n"
+                    "Send your <b>article title:</b>\n\n"
+                    "Make it descriptive and specific.\n"
+                    "Example: <i>EFCC Arrests Lagos Businessman Over ₦500M Fraud</i>\n\n"
+                    "Send /cancelwrite to cancel."
+                )
+                return {"ok": True}
+
+            elif text == "/cancelwrite":
+                if str(user_id) in write_sessions:
+                    write_sessions.pop(str(user_id))
+                    await send_telegram(chat_id, "✅ Article creation cancelled.")
+                else:
+                    await send_telegram(chat_id, "No active write session.")
+                return {"ok": True}
                 if not is_admin(user_id):
                     await send_telegram(chat_id, "⛔ Admins only.")
                     return {"ok": True}
@@ -3456,7 +3628,8 @@ Return ONLY this JSON — no markdown, no preamble:
                     "/trends — See what's trending in Nigeria now\n"
                     "/generate — Generate trending articles (add category e.g. /generate football)\n"
                     "/addtopic — Add a single topic manually (bot shows format guide)\n"
-                    "/addtopics — Add multiple topics at once (bot prompts you)\n\n"
+                    "/addtopics — Add multiple topics at once (bot prompts you)\n"
+                    "/write — Write and publish your own article manually\n\n"
                     "<b>Category Shortcuts:</b>\n"
                     "/football ⚽ /finance 💰 /entertainment 🎭\n"
                     "/tech 📱 /health 🏥 /education 📚 /news 📰\n\n"
