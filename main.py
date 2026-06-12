@@ -2938,7 +2938,70 @@ async def delete_article(article_id: int):
         raise HTTPException(status_code=404, detail="Article not found")
     return {"success": True, "deleted": dict(row)}
 
-@app.get("/api/health")
+@app.get("/sitemap.xml", response_class=Response)
+async def sitemap():
+    """Generate XML sitemap for Google Search Console."""
+    try:
+        conn = get_db()
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT slug, published_at, updated_at
+            FROM articles
+            WHERE status='published'
+            ORDER BY published_at DESC
+            LIMIT 1000
+        """)
+        articles = cur.fetchall()
+        cur.close()
+        conn.close()
+
+        base = "https://naijaflashng.com"
+        urls = [f"""  <url>
+    <loc>{base}/</loc>
+    <changefreq>hourly</changefreq>
+    <priority>1.0</priority>
+  </url>"""]
+
+        for cat in ['news', 'football', 'entertainment', 'finance', 'tech', 'health', 'education']:
+            urls.append(f"""  <url>
+    <loc>{base}/category/{cat}</loc>
+    <changefreq>daily</changefreq>
+    <priority>0.8</priority>
+  </url>""")
+
+        for a in articles:
+            lastmod = ""
+            if a.get('updated_at') or a.get('published_at'):
+                date = a.get('updated_at') or a.get('published_at')
+                if hasattr(date, 'strftime'):
+                    lastmod = f"\n    <lastmod>{date.strftime('%Y-%m-%d')}</lastmod>"
+            urls.append(f"""  <url>
+    <loc>{base}/article/{a['slug']}</loc>{lastmod}
+    <changefreq>weekly</changefreq>
+    <priority>0.7</priority>
+  </url>""")
+
+        xml = f"""<?xml version="1.0" encoding="UTF-8"?>
+<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
+{chr(10).join(urls)}
+</urlset>"""
+
+        return Response(content=xml, media_type="application/xml",
+                       headers={"Cache-Control": "public, max-age=3600"})
+
+    except Exception as e:
+        logger.error(f"Sitemap error: {e}")
+        return Response(content="<?xml version='1.0'?><urlset/>", media_type="application/xml")
+
+
+@app.get("/robots.txt", response_class=Response)
+async def robots():
+    """Robots.txt for search engines."""
+    content = """User-agent: *
+Allow: /
+Sitemap: https://naijaflashng.com/sitemap.xml
+"""
+    return Response(content=content, media_type="text/plain")
 async def health():
     try:
         conn = get_db()
