@@ -286,6 +286,9 @@ def init_db():
         CREATE INDEX IF NOT EXISTS idx_articles_status ON articles(status);
         CREATE INDEX IF NOT EXISTS idx_articles_category ON articles(category);
         CREATE INDEX IF NOT EXISTS idx_articles_created ON articles(created_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_articles_published ON articles(published_at DESC NULLS LAST);
+        CREATE INDEX IF NOT EXISTS idx_articles_status_published ON articles(status, published_at DESC NULLS LAST);
+        CREATE INDEX IF NOT EXISTS idx_articles_status_cat ON articles(status, category, published_at DESC NULLS LAST);
     """)
     if TELEGRAM_ADMIN_CHAT_ID:
         try:
@@ -3086,8 +3089,10 @@ async def telegram_webhook(request: Request):
                     f"Send any photo from your phone and it will replace the current image.\n\n"
                     f"Send /cancelimage to cancel."
                 )
+
+            elif cb_data.startswith("changecat_"):
                 article_id = int(cb_data.split("_")[1])
-                # Show category selection buttons (real categories only — not uncategorized)
+                # Show category selection buttons
                 cat_buttons = []
                 cat_emojis = {"football":"⚽","finance":"💰","entertainment":"🎭","tech":"📱","health":"🏥","education":"📚","news":"📰"}
                 row = []
