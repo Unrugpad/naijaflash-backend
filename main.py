@@ -2078,7 +2078,7 @@ def get_write_session(user_id: str) -> dict:
 
 def delete_write_session(user_id: str):
     """Delete write session from memory and DB."""
-    delete_write_session(user_id)
+    write_sessions.pop(user_id, None)
     try:
         conn = get_db()
         cur = conn.cursor()
