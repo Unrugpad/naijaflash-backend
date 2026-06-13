@@ -3424,8 +3424,9 @@ async def telegram_webhook(request: Request):
 
             # ── WRITE SESSION HANDLER ──
             # If admin is in a write session, handle each step
-            if str(user_id) in write_sessions and "photo" not in msg and (not text.startswith("/") or text == "/skip"):
-                session = get_write_session(str(user_id))
+            _write_session_check = get_write_session(str(user_id))
+            if _write_session_check and "photo" not in msg and (not text.startswith("/") or text == "/skip"):
+                session = _write_session_check
                 step = session.get("step")
 
                 if step == "title":
@@ -3504,8 +3505,9 @@ async def telegram_webhook(request: Request):
                 return {"ok": True}
 
             # ── WRITE SESSION PHOTO HANDLER ──
-            if str(user_id) in write_sessions and "photo" in msg:
-                session = get_write_session(str(user_id))
+            _write_photo_session = get_write_session(str(user_id))
+            if _write_photo_session and "photo" in msg:
+                session = _write_photo_session
                 if session.get("step") == "image":
                     try:
                         photos = msg["photo"]
@@ -3727,15 +3729,12 @@ Return ONLY this JSON — no markdown, no preamble:
                 return {"ok": True}
 
             elif text == "/cancelwrite":
-                if str(user_id) in write_sessions:
+                if get_write_session(str(user_id)):
                     delete_write_session(str(user_id))
                     await send_telegram(chat_id, "✅ Article creation cancelled.")
                 else:
                     await send_telegram(chat_id, "No active write session.")
                 return {"ok": True}
-                if not is_admin(user_id):
-                    await send_telegram(chat_id, "⛔ Admins only.")
-                    return {"ok": True}
                 addtopics_sessions.add(user_id)
                 await send_telegram(chat_id,
                     "📝 <b>Send your trending topics — one per line.</b>\n\n"
