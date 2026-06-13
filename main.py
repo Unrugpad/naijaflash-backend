@@ -289,6 +289,11 @@ def init_db():
         CREATE INDEX IF NOT EXISTS idx_articles_published ON articles(published_at DESC NULLS LAST);
         CREATE INDEX IF NOT EXISTS idx_articles_status_published ON articles(status, published_at DESC NULLS LAST);
         CREATE INDEX IF NOT EXISTS idx_articles_status_cat ON articles(status, category, published_at DESC NULLS LAST);
+        CREATE TABLE IF NOT EXISTS write_sessions_db (
+            user_id TEXT PRIMARY KEY,
+            session_data TEXT NOT NULL,
+            updated_at TIMESTAMP DEFAULT NOW()
+        );
     """)
     if TELEGRAM_ADMIN_CHAT_ID:
         try:
@@ -2030,8 +2035,59 @@ edit_sessions: dict = {}
 addtopics_sessions: set = set()
 # Image sessions: tracks which admin is uploading a custom image for which article
 image_sessions: dict = {}
-# Write sessions: tracks manual article creation step by step
-write_sessions: dict = {}  # user_id -> {step, title, body, image_url, source_link}
+# Write sessions: in-memory cache + DB persistence
+write_sessions: dict = {}
+
+def save_write_session(user_id: str, session: dict):
+    """Save write session to DB for persistence across restarts."""
+    import json as _json
+    write_sessions[user_id] = session
+    try:
+        conn = get_db()
+        cur = conn.cursor()
+        cur.execute("""
+            INSERT INTO write_sessions_db (user_id, session_data, updated_at)
+            VALUES (%s, %s, NOW())
+            ON CONFLICT (user_id) DO UPDATE SET session_data=EXCLUDED.session_data, updated_at=NOW()
+        """, (user_id, _json.dumps(session)))
+        conn.commit()
+        cur.close()
+        conn.close()
+    except Exception as e:
+        logger.error(f"Failed to save write session: {e}")
+
+def get_write_session(user_id: str) -> dict:
+    """Get write session from memory or DB."""
+    import json as _json
+    if user_id in write_sessions:
+        return write_sessions[user_id]
+    try:
+        conn = get_db()
+        cur = conn.cursor()
+        cur.execute("SELECT session_data FROM write_sessions_db WHERE user_id=%s", (user_id,))
+        row = cur.fetchone()
+        cur.close()
+        conn.close()
+        if row:
+            session = _json.loads(row['session_data'])
+            write_sessions[user_id] = session
+            return session
+    except Exception as e:
+        logger.error(f"Failed to get write session: {e}")
+    return None
+
+def delete_write_session(user_id: str):
+    """Delete write session from memory and DB."""
+    delete_write_session(user_id)
+    try:
+        conn = get_db()
+        cur = conn.cursor()
+        cur.execute("DELETE FROM write_sessions_db WHERE user_id=%s", (user_id,))
+        conn.commit()
+        cur.close()
+        conn.close()
+    except Exception as e:
+        logger.error(f"Failed to delete write session: {e}")
 async def send_to_all_admins(text: str, reply_markup: dict = None):
     for chat_id in get_all_admins():
         await send_telegram(chat_id, text, reply_markup)
@@ -3129,7 +3185,7 @@ async def telegram_webhook(request: Request):
                 parts = cb_data.split("_")
                 session_user_id = parts[1]
                 category = parts[2]
-                session = write_sessions.get(session_user_id)
+                session = get_write_session(session_user_id)
                 if not session:
                     await send_telegram(cb["from"]["id"], "❌ Session expired. Start again with /write.")
                     return {"ok": True}
@@ -3226,7 +3282,7 @@ async def telegram_webhook(request: Request):
                     conn.close()
 
                     # Clear write session
-                    write_sessions.pop(session_user_id, None)
+                    delete_write_session(session_user_id)
 
                     # Confirm to user
                     await send_telegram(cb["from"]["id"], f"✅ Article saved as #{article_id}. Sending full preview...")
@@ -3369,12 +3425,13 @@ async def telegram_webhook(request: Request):
             # ── WRITE SESSION HANDLER ──
             # If admin is in a write session, handle each step
             if str(user_id) in write_sessions and "photo" not in msg and (not text.startswith("/") or text == "/skip"):
-                session = write_sessions[str(user_id)]
+                session = get_write_session(str(user_id))
                 step = session.get("step")
 
                 if step == "title":
                     session["title"] = text.strip()
                     session["step"] = "body"
+                    save_write_session(str(user_id), session)
                     await send_telegram(chat_id,
                         f"✅ Title saved.\n\n"
                         f"📝 <b>Step 2/5 — Send your article body:</b>\n\n"
@@ -3391,6 +3448,7 @@ async def telegram_webhook(request: Request):
                 elif step == "body":
                     session["body"] = text.strip()
                     session["step"] = "image"
+                    save_write_session(str(user_id), session)
                     await send_telegram(chat_id,
                         f"✅ Article body saved.\n\n"
                         f"📷 <b>Step 3/5 — Add an image:</b>\n\n"
@@ -3422,11 +3480,9 @@ async def telegram_webhook(request: Request):
                     return {"ok": True}
 
                 elif step == "source":
-                    if text == "/skip":
-                        session["source_link"] = ""
-                    else:
-                        session["source_link"] = text.strip()
+                    session["source_link"] = text.strip() if text != "/skip" else ""
                     session["step"] = "category"
+                    save_write_session(str(user_id), session)
                     # Show category buttons
                     cat_emojis = {"football":"⚽","finance":"💰","entertainment":"🎭","tech":"📱","health":"🏥","education":"📚","news":"📰"}
                     cat_buttons = []
@@ -3449,7 +3505,7 @@ async def telegram_webhook(request: Request):
 
             # ── WRITE SESSION PHOTO HANDLER ──
             if str(user_id) in write_sessions and "photo" in msg:
-                session = write_sessions[str(user_id)]
+                session = get_write_session(str(user_id))
                 if session.get("step") == "image":
                     try:
                         photos = msg["photo"]
@@ -3472,6 +3528,7 @@ async def telegram_webhook(request: Request):
 
                         session["image_url"] = image_url
                         session["step"] = "source"
+                        save_write_session(str(user_id), session)
                         await send_telegram(chat_id,
                             f"✅ Image uploaded and saved permanently.\n\n"
                             f"🔗 <b>Step 4/5 — Send a source link:</b>\n\n"
@@ -3659,7 +3716,7 @@ Return ONLY this JSON — no markdown, no preamble:
                 if not is_admin(user_id):
                     await send_telegram(chat_id, "⛔ Admins only.")
                     return {"ok": True}
-                write_sessions[str(user_id)] = {"step": "title"}
+                save_write_session(str(user_id), {"step": "title"})
                 await send_telegram(chat_id,
                     "✍️ <b>Create Article — Step 1/5</b>\n\n"
                     "Send your <b>article title:</b>\n\n"
@@ -3671,7 +3728,7 @@ Return ONLY this JSON — no markdown, no preamble:
 
             elif text == "/cancelwrite":
                 if str(user_id) in write_sessions:
-                    write_sessions.pop(str(user_id))
+                    delete_write_session(str(user_id))
                     await send_telegram(chat_id, "✅ Article creation cancelled.")
                 else:
                     await send_telegram(chat_id, "No active write session.")
