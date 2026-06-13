@@ -2187,6 +2187,36 @@ async def upload_to_imgbb(file_id: str) -> str:
         return ""
 
 
+def convert_inline_md(text: str) -> str:
+    """Convert inline markdown to HTML: [text](url) and **bold**"""
+    import re as _re
+    text = _re.sub(r'\[([^\]]+)\]\((https?://[^\)]+)\)', r'<a href="\2" target="_blank">\1</a>', text)
+    text = _re.sub(r'\*\*(.+?)\*\*', r'<strong>\1</strong>', text)
+    return text
+
+def convert_write_body(text: str) -> str:
+    """Convert plain text with markdown to HTML paragraphs and headings."""
+    lines = text.split('\n')
+    html_parts = []
+    current_para = []
+    for line in lines:
+        stripped = line.strip()
+        if not stripped:
+            if current_para:
+                html_parts.append(f'<p>{convert_inline_md(" ".join(current_para))}</p>')
+                current_para = []
+        elif stripped.startswith('*') and stripped.endswith('*') and len(stripped) > 2:
+            if current_para:
+                html_parts.append(f'<p>{convert_inline_md(" ".join(current_para))}</p>')
+                current_para = []
+            html_parts.append(f'<h2>{stripped[1:-1].strip()}</h2>')
+        else:
+            current_para.append(stripped)
+    if current_para:
+        html_parts.append(f'<p>{convert_inline_md(" ".join(current_para))}</p>')
+    return ''.join(html_parts)
+
+
 async def send_article_for_approval(article_id: int, title: str, excerpt: str, category: str, topic: str):
     """
     Send full article preview for approval:
@@ -3185,12 +3215,12 @@ async def telegram_webhook(request: Request):
                 try:
                     parts = cb_data.split("_")
                     session_user_id = parts[1]
-                    category = "_".join(parts[2:])  # handle multi-word categories
+                    category = "_".join(parts[2:])
                     logger.info(f"writecat_ called: user={session_user_id}, cat={category}")
 
                     session = get_write_session(session_user_id)
                     if not session:
-                        await send_telegram(cb["from"]["id"], f"❌ Session expired (uid={session_user_id}). Start again with /write.")
+                        await send_telegram(cb["from"]["id"], f"❌ Session expired. Start again with /write.")
                         return {"ok": True}
 
                     title = session.get("title", "")
@@ -3198,36 +3228,7 @@ async def telegram_webhook(request: Request):
                     image_url = session.get("image_url", "")
                     source_link = session.get("source_link", "")
 
-                    # Convert plain text body to HTML with markdown support
-                    import re as _re2
-
-                    def convert_write_body(text):
-                        lines = text.split("\n")
-                        html_parts = []
-                        current_para = []
-                        for line in lines:
-                            stripped = line.strip()
-                            if not stripped:
-                                if current_para:
-                                    para_text = convert_inline_md(" ".join(current_para))
-                                    html_parts.append(f"<p>{para_text}</p>")
-                                    current_para = []
-                            elif stripped.startswith("*") and stripped.endswith("*") and len(stripped) > 2:
-                                if current_para:
-                                    html_parts.append(f"<p>{convert_inline_md(' '.join(current_para))}</p>")
-                                    current_para = []
-                                html_parts.append(f"<h2>{stripped[1:-1].strip()}</h2>")
-                            else:
-                                current_para.append(stripped)
-                        if current_para:
-                            html_parts.append(f"<p>{convert_inline_md(' '.join(current_para))}</p>")
-                        return "".join(html_parts)
-
-                    def convert_inline_md(text):
-                        text = _re2.sub(r"\[([^\]]+)\]\((https?://[^\)]+)\)", r'<a href="\2" target="_blank">\1</a>', text)
-                        text = _re2.sub(r"\*\*(.+?)\*\*", r"<strong>\1</strong>", text)
-                        return text
-
+                    # Convert plain text to HTML using module-level functions
                     body_html = convert_write_body(body_text)
                     if source_link:
                         body_html += f'<p><strong>Source:</strong> <a href="{source_link}" target="_blank">{source_link}</a></p>'
@@ -3263,9 +3264,7 @@ async def telegram_webhook(request: Request):
                     cur.close()
                     conn.close()
 
-                    # Clear write session
                     delete_write_session(session_user_id)
-
                     await send_telegram(cb["from"]["id"], f"✅ Article saved as #{article_id}. Sending full preview...")
                     await send_article_for_approval(article_id, title, excerpt, category, f"manual-{article_id}")
 
