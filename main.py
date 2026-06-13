@@ -3182,97 +3182,76 @@ async def telegram_webhook(request: Request):
                 )
 
             elif cb_data.startswith("writecat_"):
-                parts = cb_data.split("_")
-                logger.info(f"writecat_ callback: parts={parts}, cb_data={cb_data}")
-                session_user_id = parts[1]
-                category = parts[2]
-                logger.info(f"Looking up session for user_id={session_user_id}")
-                session = get_write_session(session_user_id)
-                logger.info(f"Session found: {session is not None}, session={session}")
-                if not session:
-                    await send_telegram(cb["from"]["id"], f"❌ Session expired. Debug: user_id={session_user_id}, parts={parts}. Start again with /write.")
-                    return {"ok": True}
-
-                title = session.get("title", "")
-                body_text = session.get("body", "")
-                image_url = session.get("image_url", "")
-                source_link = session.get("source_link", "")
-
-                # Convert plain text body to HTML with markdown support
-                # Support: *heading* → <h2>, [text](url) → <a href>, blank lines → paragraphs
-                import re as _re
-
-                def convert_write_body(text: str) -> str:
-                    lines = text.split('\n')
-                    html_parts = []
-                    current_para = []
-
-                    for line in lines:
-                        stripped = line.strip()
-
-                        if not stripped:
-                            # Blank line = end of paragraph
-                            if current_para:
-                                para_text = ' '.join(current_para)
-                                # Convert inline markdown in paragraph
-                                para_text = convert_inline(para_text)
-                                html_parts.append(f'<p>{para_text}</p>')
-                                current_para = []
-                        elif stripped.startswith('*') and stripped.endswith('*') and len(stripped) > 2:
-                            # *Heading* → <h2>
-                            if current_para:
-                                para_text = convert_inline(' '.join(current_para))
-                                html_parts.append(f'<p>{para_text}</p>')
-                                current_para = []
-                            heading = stripped[1:-1].strip()
-                            html_parts.append(f'<h2>{heading}</h2>')
-                        else:
-                            current_para.append(stripped)
-
-                    # Remaining paragraph
-                    if current_para:
-                        para_text = convert_inline(' '.join(current_para))
-                        html_parts.append(f'<p>{para_text}</p>')
-
-                    return ''.join(html_parts)
-
-                def convert_inline(text: str) -> str:
-                    import re as _re2
-                    # [link text](url) → <a href="url">link text</a>
-                    text = _re2.sub(
-                        r'\[([^\]]+)\]\((https?://[^\)]+)\)',
-                        r'<a href="\2" target="_blank">\1</a>',
-                        text
-                    )
-                    # **bold** → <strong>
-                    text = _re2.sub(r'\*\*(.+?)\*\*', r'<strong>\1</strong>', text)
-                    return text
-
-                body_html = convert_write_body(body_text)
-
-                # Add source link if provided
-                if source_link:
-                    body_html += f'<p><strong>Source:</strong> <a href="{source_link}">{source_link}</a></p>'
-
-                # Generate excerpt from first paragraph
-                excerpt = paragraphs[0][:200] if paragraphs else title
-
-                # Get default image if none provided
-                if not image_url:
-                    default_images = {
-                        "football": "https://images.unsplash.com/photo-1574629810360-7efbbe195018?w=900&q=80",
-                        "finance": "https://images.unsplash.com/photo-1611974789855-9c2a0a7236a3?w=900&q=80",
-                        "entertainment": "https://images.unsplash.com/photo-1493225457124-a3eb161ffa5f?w=900&q=80",
-                        "tech": "https://images.unsplash.com/photo-1518770660439-4636190af475?w=900&q=80",
-                        "health": "https://images.unsplash.com/photo-1559757148-5c350d0d3c56?w=900&q=80",
-                        "education": "https://images.unsplash.com/photo-1481627834876-b7833e8f5570?w=900&q=80",
-                        "news": "https://images.unsplash.com/photo-1508921912186-1d1a45ebb3c1?w=900&q=80",
-                    }
-                    image_url = default_images.get(category, default_images["news"])
-
-                # Save to database
-                slug = slugify(title)
                 try:
+                    parts = cb_data.split("_")
+                    session_user_id = parts[1]
+                    category = "_".join(parts[2:])  # handle multi-word categories
+                    logger.info(f"writecat_ called: user={session_user_id}, cat={category}")
+
+                    session = get_write_session(session_user_id)
+                    if not session:
+                        await send_telegram(cb["from"]["id"], f"❌ Session expired (uid={session_user_id}). Start again with /write.")
+                        return {"ok": True}
+
+                    title = session.get("title", "")
+                    body_text = session.get("body", "")
+                    image_url = session.get("image_url", "")
+                    source_link = session.get("source_link", "")
+
+                    # Convert plain text body to HTML with markdown support
+                    import re as _re2
+
+                    def convert_write_body(text):
+                        lines = text.split("\n")
+                        html_parts = []
+                        current_para = []
+                        for line in lines:
+                            stripped = line.strip()
+                            if not stripped:
+                                if current_para:
+                                    para_text = convert_inline_md(" ".join(current_para))
+                                    html_parts.append(f"<p>{para_text}</p>")
+                                    current_para = []
+                            elif stripped.startswith("*") and stripped.endswith("*") and len(stripped) > 2:
+                                if current_para:
+                                    html_parts.append(f"<p>{convert_inline_md(' '.join(current_para))}</p>")
+                                    current_para = []
+                                html_parts.append(f"<h2>{stripped[1:-1].strip()}</h2>")
+                            else:
+                                current_para.append(stripped)
+                        if current_para:
+                            html_parts.append(f"<p>{convert_inline_md(' '.join(current_para))}</p>")
+                        return "".join(html_parts)
+
+                    def convert_inline_md(text):
+                        text = _re2.sub(r"\[([^\]]+)\]\((https?://[^\)]+)\)", r'<a href="\2" target="_blank">\1</a>', text)
+                        text = _re2.sub(r"\*\*(.+?)\*\*", r"<strong>\1</strong>", text)
+                        return text
+
+                    body_html = convert_write_body(body_text)
+                    if source_link:
+                        body_html += f'<p><strong>Source:</strong> <a href="{source_link}" target="_blank">{source_link}</a></p>'
+
+                    # Generate excerpt
+                    import re as _re3
+                    plain = _re3.sub(r"<[^>]+>", "", body_html).strip()
+                    excerpt = plain[:200] if plain else title
+
+                    # Default image if none
+                    if not image_url:
+                        defaults = {
+                            "football": "https://images.unsplash.com/photo-1574629810360-7efbbe195018?w=900&q=80",
+                            "finance": "https://images.unsplash.com/photo-1611974789855-9c2a0a7236a3?w=900&q=80",
+                            "entertainment": "https://images.unsplash.com/photo-1493225457124-a3eb161ffa5f?w=900&q=80",
+                            "tech": "https://images.unsplash.com/photo-1518770660439-4636190af475?w=900&q=80",
+                            "health": "https://images.unsplash.com/photo-1559757148-5c350d0d3c56?w=900&q=80",
+                            "education": "https://images.unsplash.com/photo-1481627834876-b7833e8f5570?w=900&q=80",
+                            "news": "https://images.unsplash.com/photo-1508921912186-1d1a45ebb3c1?w=900&q=80",
+                        }
+                        image_url = defaults.get(category, defaults["news"])
+
+                    # Save to database
+                    slug = slugify(title)
                     conn = get_db()
                     cur = conn.cursor()
                     cur.execute("""
@@ -3287,17 +3266,14 @@ async def telegram_webhook(request: Request):
                     # Clear write session
                     delete_write_session(session_user_id)
 
-                    # Confirm to user
                     await send_telegram(cb["from"]["id"], f"✅ Article saved as #{article_id}. Sending full preview...")
-
-                    # Send for approval with full preview
                     await send_article_for_approval(article_id, title, excerpt, category, f"manual-{article_id}")
 
                 except Exception as e:
-                    await send_telegram(cb["from"]["id"], f"❌ Error saving article: {e}")
+                    logger.error(f"writecat_ error: {e}", exc_info=True)
+                    await send_telegram(cb["from"]["id"], f"❌ Error: {e}. Please try again or use /cancelwrite.")
 
                 return {"ok": True}
-
             elif cb_data.startswith("changecat_"):
                 article_id = int(cb_data.split("_")[1])
                 # Show category selection buttons
