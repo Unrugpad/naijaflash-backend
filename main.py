@@ -3139,11 +3139,57 @@ async def telegram_webhook(request: Request):
                 image_url = session.get("image_url", "")
                 source_link = session.get("source_link", "")
 
-                # Convert plain text body to HTML paragraphs
-                paragraphs = [p.strip() for p in body_text.split('\n\n') if p.strip()]
-                if not paragraphs:
-                    paragraphs = [body_text]
-                body_html = "".join([f"<p>{p}</p>" for p in paragraphs])
+                # Convert plain text body to HTML with markdown support
+                # Support: *heading* → <h2>, [text](url) → <a href>, blank lines → paragraphs
+                import re as _re
+
+                def convert_write_body(text: str) -> str:
+                    lines = text.split('\n')
+                    html_parts = []
+                    current_para = []
+
+                    for line in lines:
+                        stripped = line.strip()
+
+                        if not stripped:
+                            # Blank line = end of paragraph
+                            if current_para:
+                                para_text = ' '.join(current_para)
+                                # Convert inline markdown in paragraph
+                                para_text = convert_inline(para_text)
+                                html_parts.append(f'<p>{para_text}</p>')
+                                current_para = []
+                        elif stripped.startswith('*') and stripped.endswith('*') and len(stripped) > 2:
+                            # *Heading* → <h2>
+                            if current_para:
+                                para_text = convert_inline(' '.join(current_para))
+                                html_parts.append(f'<p>{para_text}</p>')
+                                current_para = []
+                            heading = stripped[1:-1].strip()
+                            html_parts.append(f'<h2>{heading}</h2>')
+                        else:
+                            current_para.append(stripped)
+
+                    # Remaining paragraph
+                    if current_para:
+                        para_text = convert_inline(' '.join(current_para))
+                        html_parts.append(f'<p>{para_text}</p>')
+
+                    return ''.join(html_parts)
+
+                def convert_inline(text: str) -> str:
+                    import re as _re2
+                    # [link text](url) → <a href="url">link text</a>
+                    text = _re2.sub(
+                        r'\[([^\]]+)\]\((https?://[^\)]+)\)',
+                        r'<a href="\2" target="_blank">\1</a>',
+                        text
+                    )
+                    # **bold** → <strong>
+                    text = _re2.sub(r'\*\*(.+?)\*\*', r'<strong>\1</strong>', text)
+                    return text
+
+                body_html = convert_write_body(body_text)
 
                 # Add source link if provided
                 if source_link:
@@ -3332,7 +3378,12 @@ async def telegram_webhook(request: Request):
                     await send_telegram(chat_id,
                         f"✅ Title saved.\n\n"
                         f"📝 <b>Step 2/5 — Send your article body:</b>\n\n"
-                        f"Write as many paragraphs as you want. Use plain text — no HTML needed.\n\n"
+                        f"<b>Formatting tips:</b>\n"
+                        f"• Separate paragraphs with a blank line\n"
+                        f"• <code>*Heading Text*</code> → Bold heading\n"
+                        f"• <code>[word](https://url.com)</code> → Clickable link\n\n"
+                        f"Example:\n"
+                        f"<code>*Prevention Tips*\nSleep under treated nets.\nClear stagnant water.\n\n[Read more](https://who.int)</code>\n\n"
                         f"Send /cancelwrite to cancel."
                     )
                     return {"ok": True}
