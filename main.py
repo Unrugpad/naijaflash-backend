@@ -3271,8 +3271,10 @@ async def telegram_webhook(request: Request):
                     await send_article_for_approval(article_id, title, excerpt, category, f"manual-{article_id}")
 
                 except Exception as e:
-                    logger.error(f"writecat_ error: {e}", exc_info=True)
-                    await send_telegram(cb["from"]["id"], f"❌ Error: {e}. Please try again or use /cancelwrite.")
+                    import traceback
+                    tb = traceback.format_exc()
+                    logger.error(f"writecat_ error: {tb}")
+                    await send_telegram(cb["from"]["id"], f"❌ Error: {str(e)[:200]}\n\nTraceback:\n{tb[-300:]}")
 
                 return {"ok": True}
             elif cb_data.startswith("changecat_"):
