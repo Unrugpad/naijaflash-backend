@@ -3183,11 +3183,14 @@ async def telegram_webhook(request: Request):
 
             elif cb_data.startswith("writecat_"):
                 parts = cb_data.split("_")
+                logger.info(f"writecat_ callback: parts={parts}, cb_data={cb_data}")
                 session_user_id = parts[1]
                 category = parts[2]
+                logger.info(f"Looking up session for user_id={session_user_id}")
                 session = get_write_session(session_user_id)
+                logger.info(f"Session found: {session is not None}, session={session}")
                 if not session:
-                    await send_telegram(cb["from"]["id"], "❌ Session expired. Start again with /write.")
+                    await send_telegram(cb["from"]["id"], f"❌ Session expired. Debug: user_id={session_user_id}, parts={parts}. Start again with /write.")
                     return {"ok": True}
 
                 title = session.get("title", "")
