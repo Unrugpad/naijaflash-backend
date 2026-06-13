@@ -2288,10 +2288,12 @@ async def send_article_for_approval(article_id: int, title: str, excerpt: str, c
             break
         # Split at last newline before CHUNK_SIZE
         split_at = remaining[:CHUNK_SIZE].rfind('\n\n')
-        if split_at == -1:
+        if split_at <= 0:  # ensure we always make progress
             split_at = CHUNK_SIZE
         body_chunks.append(remaining[:split_at])
         remaining = remaining[split_at:].strip()
+        if not remaining:  # safety break
+            break
 
     total_parts = len(body_chunks)
 
